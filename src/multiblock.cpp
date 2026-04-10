@@ -7,7 +7,7 @@ MultiBlockLBM::MultiBlockLBM(
 	const RefinementZone& zone,
 	const float fx, const float fy, const float fz
 ) : zone(zone), nu_c(nu), nu_f(2.0f*nu) {
-	// Validate zone alignment (must be even coordinates, inside coarse grid with margin)
+	// Validate zone alignment
 	if(zone.cx0%2u!=0u || zone.cy0%2u!=0u || zone.cz0%2u!=0u ||
 	   zone.cx1%2u!=0u || zone.cy1%2u!=0u || zone.cz1%2u!=0u) {
 		print_error("RefinementZone coordinates must be even multiples of 2");
@@ -17,11 +17,9 @@ MultiBlockLBM::MultiBlockLBM(
 		print_error("RefinementZone must have at least 2-cell margin from coarse grid boundary");
 	}
 
-	// Compute tau values
 	tau_c = 0.5f + 3.0f * nu_c;
-	tau_f = 0.5f + 3.0f * nu_f; // = 2*(tau_c - 0.5) + 0.5
+	tau_f = 0.5f + 3.0f * nu_f;
 
-	// Fine grid dimensions: 2x resolution in each direction
 	const uint fNx = (zone.cx1 - zone.cx0) * 2u;
 	const uint fNy = (zone.cy1 - zone.cy0) * 2u;
 	const uint fNz = (zone.cz1 - zone.cz0) * 2u;
@@ -30,119 +28,29 @@ MultiBlockLBM::MultiBlockLBM(
 	print_info("MultiBlockLBM: fine grid " + to_string(fNx) + "x" + to_string(fNy) + "x" + to_string(fNz));
 	print_info("MultiBlockLBM: tau_c=" + to_string(tau_c) + " tau_f=" + to_string(tau_f));
 
-	// Create both LBM objects (single GPU, single domain each)
-	lbm_c = new LBM(cNx, cNy, cNz, nu_c, fx, fy, fz);
-	lbm_f = new LBM(fNx, fNy, fNz, nu_f, fx, fy, fz);
+	// Create SHARED OpenCL context — both LBM objects use the same GPU device
+	const Device_Info shared_device = select_device_with_most_flops();
+
+	// Create both LBM objects using the shared device context
+	lbm_c = new LBM(shared_device, cNx, cNy, cNz, nu_c, fx, fy, fz);
+	lbm_f = new LBM(shared_device, fNx, fNy, fNz, nu_f, fx, fy, fz);
+
+	print_info("MultiBlockLBM: shared OpenCL context — GPU-side coupling enabled");
 }
 
 MultiBlockLBM::~MultiBlockLBM() {
+	delete kernel_c2f;
+	delete kernel_f2c;
+	delete dev_fine_ghost_indices;
+	delete dev_coarse_iface_indices;
+	delete dev_interp_coarse_indices;
+	delete dev_interp_weights;
+	delete dev_avg_fine_children;
 	delete lbm_c;
 	delete lbm_f;
 }
 
-void MultiBlockLBM::build_index_lists() {
-	const uint cNx = lbm_c->get_Nx(), cNy = lbm_c->get_Ny(), cNz = lbm_c->get_Nz();
-	const uint fNx = lbm_f->get_Nx(), fNy = lbm_f->get_Ny(), fNz = lbm_f->get_Nz();
-
-	// Build coarse_interface_indices: 1-cell ring at zone boundary (TYPE_E cells)
-	// Build coarse_extract_indices: 2-cell shell around zone (for trilinear interpolation stencil)
-	coarse_interface_indices.clear();
-	coarse_extract_indices.clear();
-	for(uint z=zone.cz0; z<zone.cz1; z++) {
-		for(uint y=zone.cy0; y<zone.cy1; y++) {
-			for(uint x=zone.cx0; x<zone.cx1; x++) {
-				const bool on_border = (x==zone.cx0 || x==zone.cx1-1u ||
-				                        y==zone.cy0 || y==zone.cy1-1u ||
-				                        z==zone.cz0 || z==zone.cz1-1u);
-				if(on_border) {
-					coarse_interface_indices.push_back(x + (y + z*cNy)*cNx);
-				}
-			}
-		}
-	}
-	// Extract shell: zone boundary ±1 cell (for interpolation source data)
-	for(uint z=zone.cz0-1u; z<=zone.cz1; z++) {
-		for(uint y=zone.cy0-1u; y<=zone.cy1; y++) {
-			for(uint x=zone.cx0-1u; x<=zone.cx1; x++) {
-				const bool outside_zone = (x<zone.cx0 || x>=zone.cx1 ||
-				                           y<zone.cy0 || y>=zone.cy1 ||
-				                           z<zone.cz0 || z>=zone.cz1);
-				const bool on_border = !outside_zone && (x==zone.cx0 || x==zone.cx1-1u ||
-				                                          y==zone.cy0 || y==zone.cy1-1u ||
-				                                          z==zone.cz0 || z==zone.cz1-1u);
-				if(outside_zone || on_border) {
-					coarse_extract_indices.push_back(x + (y + z*cNy)*cNx);
-				}
-			}
-		}
-	}
-
-	// Build fine_ghost_indices: outermost 1-cell ring on all 6 faces of fine grid
-	// Build ghost_mappings: for each fine ghost cell, compute coarse fractional position
-	fine_ghost_indices.clear();
-	ghost_mappings.clear();
-	for(uint z=0u; z<fNz; z++) {
-		for(uint y=0u; y<fNy; y++) {
-			for(uint x=0u; x<fNx; x++) {
-				const bool on_boundary = (x==0u || x==fNx-1u ||
-				                          y==0u || y==fNy-1u ||
-				                          z==0u || z==fNz-1u);
-				if(on_boundary) {
-					const uint n_fine = x + (y + z*fNy)*fNx;
-					fine_ghost_indices.push_back(n_fine);
-					// Map fine cell to coarse fractional coordinates
-					// Fine cell (x,y,z) in fine grid → coarse coords: (x/2 + cx0, y/2 + cy0, z/2 + cz0)
-					// Sub-cell offset: center of fine cell in coarse units
-					FineGhostMapping m;
-					m.fine_idx = n_fine;
-					m.cx = (float)zone.cx0 + ((float)x + 0.5f) * 0.5f;
-					m.cy = (float)zone.cy0 + ((float)y + 0.5f) * 0.5f;
-					m.cz = (float)zone.cz0 + ((float)z + 0.5f) * 0.5f;
-					ghost_mappings.push_back(m);
-				}
-			}
-		}
-	}
-
-	// Build interface_mappings: for each coarse interface cell, find 8 fine children
-	interface_mappings.clear();
-	for(uint i=0u; i<(uint)coarse_interface_indices.size(); i++) {
-		const uint n_c = coarse_interface_indices[i];
-		const uint cx = n_c % cNx;
-		const uint cy = (n_c / cNx) % cNy;
-		const uint cz = n_c / (cNx * cNy);
-
-		// Fine children: (2*(cx-cx0) + a, 2*(cy-cy0) + b, 2*(cz-cz0) + c) for a,b,c in {0,1}
-		const uint fx0 = 2u * (cx - zone.cx0);
-		const uint fy0 = 2u * (cy - zone.cy0);
-		const uint fz0 = 2u * (cz - zone.cz0);
-
-		CoarseInterfaceMapping m;
-		m.coarse_idx = n_c;
-		uint child = 0u;
-		for(uint dz=0u; dz<2u; dz++) {
-			for(uint dy=0u; dy<2u; dy++) {
-				for(uint dx=0u; dx<2u; dx++) {
-					m.fine_children[child++] = (fx0+dx) + ((fy0+dy) + (fz0+dz)*fNy)*fNx;
-				}
-			}
-		}
-		interface_mappings.push_back(m);
-	}
-
-	// Allocate host coupling buffers
-	buf_c2f_extract.resize(coarse_extract_indices.size() * 4u);
-	buf_c2f_interp.resize(fine_ghost_indices.size() * 4u);
-	buf_f2c_extract.resize(fine_ghost_indices.size() * 4u); // reuse size — extract from fine interface region
-	buf_f2c_avg.resize(coarse_interface_indices.size() * 4u);
-
-	print_info("MultiBlockLBM: coarse interface cells = " + to_string(coarse_interface_indices.size()));
-	print_info("MultiBlockLBM: coarse extract shell = " + to_string(coarse_extract_indices.size()));
-	print_info("MultiBlockLBM: fine ghost cells = " + to_string(fine_ghost_indices.size()));
-}
-
 void MultiBlockLBM::flag_coarse_zone() {
-	const uint cNx = lbm_c->get_Nx(), cNy = lbm_c->get_Ny();
 	parallel_for(lbm_c->get_N(), [&](ulong n) {
 		uint x, y, z;
 		lbm_c->coordinates(n, x, y, z);
@@ -168,186 +76,207 @@ void MultiBlockLBM::flag_fine_boundaries() {
 		                          y==0u || y==fNy-1u ||
 		                          z==0u || z==fNz-1u);
 		if(on_boundary) {
-			lbm_f->flags[n] = TYPE_E; // ghost ring: TYPE_E reads stored rho/u and sets DDFs=feq
+			lbm_f->flags[n] = TYPE_E; // ghost ring: TYPE_E reads stored rho/u, sets DDFs=feq
 		}
 	});
 }
 
-void MultiBlockLBM::interpolate_c2f() {
+void MultiBlockLBM::build_coupling_gpu() {
 	const uint cNx = lbm_c->get_Nx(), cNy = lbm_c->get_Ny(), cNz = lbm_c->get_Nz();
+	const uint fNx = lbm_f->get_Nx(), fNy = lbm_f->get_Ny(), fNz = lbm_f->get_Nz();
 
-	// Build a lookup from coarse extract indices → position in buf_c2f_extract
-	// For simplicity, use direct coarse grid access (host-side rho/u arrays)
-	// This avoids building a hash map — we read directly from lbm_c->rho[n], lbm_c->u.*[n]
+	// Build host-side index lists first, then upload to GPU
 
-	for(uint i=0u; i<(uint)ghost_mappings.size(); i++) {
-		const FineGhostMapping& m = ghost_mappings[i];
+	// === Fine ghost cells + interpolation mappings ===
+	vector<uint> h_fine_ghost;
+	vector<uint> h_interp_coarse; // 8 per ghost cell
+	vector<float> h_interp_weights; // 8 per ghost cell
 
-		// Trilinear interpolation from 8 surrounding coarse cells
-		const int i0 = (int)floorf(m.cx - 0.5f), j0 = (int)floorf(m.cy - 0.5f), k0 = (int)floorf(m.cz - 0.5f);
-		const float dx = m.cx - ((float)i0 + 0.5f);
-		const float dy = m.cy - ((float)j0 + 0.5f);
-		const float dz = m.cz - ((float)k0 + 0.5f);
+	for(uint z=0u; z<fNz; z++) {
+		for(uint y=0u; y<fNy; y++) {
+			for(uint x=0u; x<fNx; x++) {
+				const bool on_boundary = (x==0u || x==fNx-1u || y==0u || y==fNy-1u || z==0u || z==fNz-1u);
+				if(!on_boundary) continue;
 
-		float rho_interp=0.0f, ux_interp=0.0f, uy_interp=0.0f, uz_interp=0.0f;
-		for(uint ddk=0u; ddk<2u; ddk++) {
-			for(uint ddj=0u; ddj<2u; ddj++) {
-				for(uint ddi=0u; ddi<2u; ddi++) {
-					const uint ci = clamp((uint)(i0+(int)ddi), 0u, cNx-1u);
-					const uint cj = clamp((uint)(j0+(int)ddj), 0u, cNy-1u);
-					const uint ck = clamp((uint)(k0+(int)ddk), 0u, cNz-1u);
-					const float wx = ddi==0u ? (1.0f-dx) : dx;
-					const float wy = ddj==0u ? (1.0f-dy) : dy;
-					const float wz = ddk==0u ? (1.0f-dz) : dz;
-					const float w = wx * wy * wz;
+				const uint n_fine = x + (y + z*fNy)*fNx;
+				h_fine_ghost.push_back(n_fine);
 
-					const ulong nc = (ulong)ci + ((ulong)cj + (ulong)ck*(ulong)cNy)*(ulong)cNx;
-					rho_interp += w * lbm_c->rho[nc];
-					ux_interp  += w * lbm_c->u.x[nc];
-					uy_interp  += w * lbm_c->u.y[nc];
-					uz_interp  += w * lbm_c->u.z[nc];
+				// Map fine cell center to coarse fractional coordinates
+				const float fcx = (float)zone.cx0 + ((float)x + 0.5f) * 0.5f;
+				const float fcy = (float)zone.cy0 + ((float)y + 0.5f) * 0.5f;
+				const float fcz = (float)zone.cz0 + ((float)z + 0.5f) * 0.5f;
+
+				// Trilinear stencil: 8 coarse neighbors
+				const int i0 = (int)floorf(fcx - 0.5f);
+				const int j0 = (int)floorf(fcy - 0.5f);
+				const int k0 = (int)floorf(fcz - 0.5f);
+				const float dx = fcx - ((float)i0 + 0.5f);
+				const float dy = fcy - ((float)j0 + 0.5f);
+				const float dz = fcz - ((float)k0 + 0.5f);
+
+				for(uint dk=0u; dk<2u; dk++) {
+					for(uint dj=0u; dj<2u; dj++) {
+						for(uint di=0u; di<2u; di++) {
+							const uint ci = (uint)max(0, min((int)(cNx-1u), i0+(int)di));
+							const uint cj = (uint)max(0, min((int)(cNy-1u), j0+(int)dj));
+							const uint ck = (uint)max(0, min((int)(cNz-1u), k0+(int)dk));
+							h_interp_coarse.push_back(ci + (cj + ck*cNy)*cNx);
+
+							const float wx = di==0u ? (1.0f-dx) : dx;
+							const float wy = dj==0u ? (1.0f-dy) : dy;
+							const float wz = dk==0u ? (1.0f-dz) : dz;
+							h_interp_weights.push_back(wx * wy * wz);
+						}
+					}
 				}
 			}
 		}
-
-		buf_c2f_interp[i*4u+0u] = rho_interp;
-		buf_c2f_interp[i*4u+1u] = ux_interp;
-		buf_c2f_interp[i*4u+2u] = uy_interp;
-		buf_c2f_interp[i*4u+3u] = uz_interp;
 	}
+	n_fine_ghost = (uint)h_fine_ghost.size();
+
+	// === Coarse interface cells + averaging mappings ===
+	vector<uint> h_coarse_iface;
+	vector<uint> h_avg_children; // 8 per interface cell
+
+	for(uint z=zone.cz0; z<zone.cz1; z++) {
+		for(uint y=zone.cy0; y<zone.cy1; y++) {
+			for(uint x=zone.cx0; x<zone.cx1; x++) {
+				const bool on_border = (x==zone.cx0 || x==zone.cx1-1u ||
+				                        y==zone.cy0 || y==zone.cy1-1u ||
+				                        z==zone.cz0 || z==zone.cz1-1u);
+				if(!on_border) continue;
+
+				h_coarse_iface.push_back(x + (y + z*cNy)*cNx);
+
+				// 8 fine children
+				const uint fx0 = 2u * (x - zone.cx0);
+				const uint fy0 = 2u * (y - zone.cy0);
+				const uint fz0 = 2u * (z - zone.cz0);
+				for(uint dk=0u; dk<2u; dk++) {
+					for(uint dj=0u; dj<2u; dj++) {
+						for(uint di=0u; di<2u; di++) {
+							h_avg_children.push_back((fx0+di) + ((fy0+dj) + (fz0+dk)*fNy)*fNx);
+						}
+					}
+				}
+			}
+		}
+	}
+	n_coarse_iface = (uint)h_coarse_iface.size();
+
+	print_info("MultiBlockLBM: fine ghost cells = " + to_string(n_fine_ghost) + ", coarse interface cells = " + to_string(n_coarse_iface));
+
+	// === Upload index/weight arrays to GPU ===
+	Device& dev = lbm_c->lbm_domain[0]->device; // shared device
+
+	dev_fine_ghost_indices = new Memory<uint>(dev, n_fine_ghost);
+	dev_coarse_iface_indices = new Memory<uint>(dev, n_coarse_iface);
+	dev_interp_coarse_indices = new Memory<uint>(dev, n_fine_ghost * 8u);
+	dev_interp_weights = new Memory<float>(dev, n_fine_ghost * 8u);
+	dev_avg_fine_children = new Memory<uint>(dev, n_coarse_iface * 8u);
+
+	for(uint i=0u; i<n_fine_ghost; i++) (*dev_fine_ghost_indices)[i] = h_fine_ghost[i];
+	for(uint i=0u; i<n_coarse_iface; i++) (*dev_coarse_iface_indices)[i] = h_coarse_iface[i];
+	for(uint i=0u; i<n_fine_ghost*8u; i++) (*dev_interp_coarse_indices)[i] = h_interp_coarse[i];
+	for(uint i=0u; i<n_fine_ghost*8u; i++) (*dev_interp_weights)[i] = h_interp_weights[i];
+	for(uint i=0u; i<n_coarse_iface*8u; i++) (*dev_avg_fine_children)[i] = h_avg_children[i];
+
+	dev_fine_ghost_indices->enqueue_write_to_device();
+	dev_coarse_iface_indices->enqueue_write_to_device();
+	dev_interp_coarse_indices->enqueue_write_to_device();
+	dev_interp_weights->enqueue_write_to_device();
+	dev_avg_fine_children->enqueue_write_to_device();
+	dev.finish_queue();
+
+	// === Compile GPU coupling kernels ===
+	// These kernels run in the shared context and directly access both grids' rho/u buffers
+	const ulong cN = lbm_c->get_N();
+	const ulong fN = lbm_f->get_N();
+
+	// C→F kernel: trilinear interpolation from coarse rho/u → fine ghost rho/u
+	kernel_c2f = new Kernel(dev, n_fine_ghost, "coupling_c2f",
+		lbm_c->lbm_domain[0]->rho, // coarse rho (read)
+		lbm_c->lbm_domain[0]->u,   // coarse u (read)
+		lbm_f->lbm_domain[0]->rho, // fine rho (write)
+		lbm_f->lbm_domain[0]->u,   // fine u (write)
+		*dev_fine_ghost_indices,     // fine ghost cell indices
+		*dev_interp_coarse_indices,  // 8 coarse source indices per ghost cell
+		*dev_interp_weights,         // 8 weights per ghost cell
+		cN, fN, n_fine_ghost
+	);
+
+	// F→C kernel: volume average from fine rho/u → coarse interface rho/u
+	kernel_f2c = new Kernel(dev, n_coarse_iface, "coupling_f2c",
+		lbm_f->lbm_domain[0]->rho, // fine rho (read)
+		lbm_f->lbm_domain[0]->u,   // fine u (read)
+		lbm_c->lbm_domain[0]->rho, // coarse rho (write)
+		lbm_c->lbm_domain[0]->u,   // coarse u (write)
+		*dev_coarse_iface_indices,   // coarse interface cell indices
+		*dev_avg_fine_children,      // 8 fine child indices per interface cell
+		cN, fN, n_coarse_iface
+	);
+
+	print_info("MultiBlockLBM: GPU coupling kernels compiled");
 }
 
-void MultiBlockLBM::average_f2c() {
-	for(uint i=0u; i<(uint)interface_mappings.size(); i++) {
-		const CoarseInterfaceMapping& m = interface_mappings[i];
-		float rho_avg=0.0f, ux_avg=0.0f, uy_avg=0.0f, uz_avg=0.0f;
-		for(uint c=0u; c<8u; c++) {
-			const ulong nf = (ulong)m.fine_children[c];
-			rho_avg += lbm_f->rho[nf];
-			ux_avg  += lbm_f->u.x[nf];
-			uy_avg  += lbm_f->u.y[nf];
-			uz_avg  += lbm_f->u.z[nf];
-		}
-		buf_f2c_avg[i*4u+0u] = rho_avg * 0.125f; // /8
-		buf_f2c_avg[i*4u+1u] = ux_avg  * 0.125f;
-		buf_f2c_avg[i*4u+2u] = uy_avg  * 0.125f;
-		buf_f2c_avg[i*4u+3u] = uz_avg  * 0.125f;
-	}
+void MultiBlockLBM::gpu_push_c2f() {
+	kernel_c2f->enqueue_run();
+}
+
+void MultiBlockLBM::gpu_push_f2c() {
+	kernel_f2c->enqueue_run();
 }
 
 void MultiBlockLBM::initialize() {
-	// Flag coarse zone and fine boundaries (before user setup, so user can override interior cells)
 	flag_coarse_zone();
 	flag_fine_boundaries();
 
-	// Build coupling index lists and buffers
-	build_index_lists();
-
-	// Set initial rho/u for coupling cells from coarse initial conditions
-	interpolate_c2f();
-	for(uint i=0u; i<(uint)fine_ghost_indices.size(); i++) {
-		const ulong nf = (ulong)fine_ghost_indices[i];
-		lbm_f->rho[nf]  = buf_c2f_interp[i*4u+0u];
-		lbm_f->u.x[nf]  = buf_c2f_interp[i*4u+1u];
-		lbm_f->u.y[nf]  = buf_c2f_interp[i*4u+2u];
-		lbm_f->u.z[nf]  = buf_c2f_interp[i*4u+3u];
-	}
-
-	// Initialize both LBM objects (copies host data to GPU, runs kernel_initialize)
+	// Initialize both LBM objects (copies host data to GPU, compiles kernels)
 	lbm_c->initialize();
 	lbm_f->initialize();
+
+	// Build GPU coupling after LBM initialization (buffers must exist on device)
+	build_coupling_gpu();
+
+	// Initial C→F coupling to set fine ghost cells from coarse initial conditions
+	gpu_push_c2f();
+	lbm_c->lbm_domain[0]->finish_queue();
 
 	t_coarse = 0ull;
 	t_fine = 0ull;
 
-	print_info("MultiBlockLBM: initialized");
+	print_info("MultiBlockLBM: initialized (GPU-side coupling, zero PCIe transfers per step)");
 }
 
 void MultiBlockLBM::run(const ulong coarse_steps) {
 	if(!lbm_c->initialized) initialize();
 
-	// Helper lambdas for coupling transfers (read-modify-write only coupling cells)
-	auto push_c2f = [&]() { // interpolate coarse→fine ghost cells, write rho/u to fine device
-		// Read coarse rho/u from device
-		for(uint d=0u; d<lbm_c->get_D(); d++) {
-			lbm_c->lbm_domain[d]->rho.read_from_device();
-			lbm_c->lbm_domain[d]->u.read_from_device();
-		}
-		interpolate_c2f();
-		// Read fine rho/u from device (so we don't overwrite interior cells)
-		for(uint d=0u; d<lbm_f->get_D(); d++) {
-			lbm_f->lbm_domain[d]->rho.read_from_device();
-			lbm_f->lbm_domain[d]->u.read_from_device();
-		}
-		// Modify ONLY ghost cells on host
-		for(uint i=0u; i<(uint)fine_ghost_indices.size(); i++) {
-			const ulong nf = (ulong)fine_ghost_indices[i];
-			lbm_f->rho[nf]  = buf_c2f_interp[i*4u+0u];
-			lbm_f->u.x[nf]  = buf_c2f_interp[i*4u+1u];
-			lbm_f->u.y[nf]  = buf_c2f_interp[i*4u+2u];
-			lbm_f->u.z[nf]  = buf_c2f_interp[i*4u+3u];
-		}
-		// Write full arrays back (now only ghost cells differ from device state)
-		for(uint d=0u; d<lbm_f->get_D(); d++) {
-			lbm_f->lbm_domain[d]->rho.write_to_device();
-			lbm_f->lbm_domain[d]->u.write_to_device();
-		}
-	};
-
-	auto push_f2c = [&]() { // average fine→coarse interface cells, write rho/u to coarse device
-		// Read fine rho/u from device
-		for(uint d=0u; d<lbm_f->get_D(); d++) {
-			lbm_f->lbm_domain[d]->rho.read_from_device();
-			lbm_f->lbm_domain[d]->u.read_from_device();
-		}
-		average_f2c();
-		// Read coarse rho/u from device (so we don't overwrite non-interface cells)
-		for(uint d=0u; d<lbm_c->get_D(); d++) {
-			lbm_c->lbm_domain[d]->rho.read_from_device();
-			lbm_c->lbm_domain[d]->u.read_from_device();
-		}
-		// Modify ONLY interface cells on host
-		for(uint i=0u; i<(uint)coarse_interface_indices.size(); i++) {
-			const ulong nc = (ulong)coarse_interface_indices[i];
-			lbm_c->rho[nc]  = buf_f2c_avg[i*4u+0u];
-			lbm_c->u.x[nc]  = buf_f2c_avg[i*4u+1u];
-			lbm_c->u.y[nc]  = buf_f2c_avg[i*4u+2u];
-			lbm_c->u.z[nc]  = buf_f2c_avg[i*4u+3u];
-		}
-		// Write full arrays back
-		for(uint d=0u; d<lbm_c->get_D(); d++) {
-			lbm_c->lbm_domain[d]->rho.write_to_device();
-			lbm_c->lbm_domain[d]->u.write_to_device();
-		}
-	};
-
 	for(ulong step=0ull; step<coarse_steps; step++) {
-		// === Step 1: C→F coupling (use current coarse data) ===
-		push_c2f();
+		// === Step 1: C→F coupling (GPU kernel, no PCIe) ===
+		gpu_push_c2f();
 
 		// === Step 2: Fine sub-step 1 ===
 		lbm_f->do_time_step();
 		t_fine++;
 
-		// === Step 3: F→C coupling (restrict fine → coarse interface) ===
-		push_f2c();
+		// === Step 3: F→C coupling (GPU kernel, no PCIe) ===
+		gpu_push_f2c();
 
-		// === Step 4: Coarse step (with fresh interface data) ===
+		// === Step 4: Coarse step ===
 		lbm_c->do_time_step();
 		t_coarse++;
 
-		// === Step 5: C→F coupling again (use NEW coarse data post-step) ===
-		push_c2f();
+		// === Step 5: C→F coupling again (post-coarse data) ===
+		gpu_push_c2f();
 
 		// === Step 6: Fine sub-step 2 ===
 		lbm_f->do_time_step();
 		t_fine++;
 
 		// === Step 7: F→C coupling (final restriction) ===
-		push_f2c();
+		gpu_push_f2c();
 	}
 
-	// Final sync
-	for(uint d=0u; d<lbm_c->get_D(); d++) lbm_c->lbm_domain[d]->finish_queue();
-	for(uint d=0u; d<lbm_f->get_D(); d++) lbm_f->lbm_domain[d]->finish_queue();
+	lbm_c->lbm_domain[0]->finish_queue();
+	lbm_f->lbm_domain[0]->finish_queue();
 }

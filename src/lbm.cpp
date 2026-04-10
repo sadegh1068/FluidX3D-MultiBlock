@@ -668,6 +668,53 @@ vector<Device_Info> smart_device_selection(const uint D) {
 LBM::LBM(const uint Nx, const uint Ny, const uint Nz, const float nu, const float fx, const float fy, const float fz, const float sigma, const float alpha, const float beta, const uint particles_N, const float particles_rho) // single device
 	:LBM(Nx, Ny, Nz, 1u, 1u, 1u, nu, fx, fy, fz, sigma, alpha, beta, particles_N, particles_rho) { // delegating constructor
 }
+LBM::LBM(const Device_Info& device_info, const uint Nx, const uint Ny, const uint Nz, const float nu, const float fx, const float fy, const float fz, const float sigma, const float alpha, const float beta, const uint particles_N, const float particles_rho) { // shared-context single-domain constructor
+	this->Nx = Nx; this->Ny = Ny; this->Nz = Nz;
+	this->Dx = 1u; this->Dy = 1u; this->Dz = 1u;
+	const uint D = 1u;
+	vector<Device_Info> device_infos_vec = { device_info };
+	sanity_checks_constructor(device_infos_vec, Nx, Ny, Nz, 1u, 1u, 1u, nu, fx, fy, fz, sigma, alpha, beta, particles_N, particles_rho);
+	lbm_domain = new LBM_Domain*[D];
+	lbm_domain[0] = new LBM_Domain(device_info, Nx, Ny, Nz, 1u, 1u, 1u, 0, 0, 0, nu, fx, fy, fz, sigma, alpha, beta, particles_N, particles_rho);
+	{
+		Memory<float>** buffers_rho = new Memory<float>*[D];
+		buffers_rho[0] = &(lbm_domain[0]->rho);
+		rho = Memory_Container(this, buffers_rho, "rho");
+	} {
+		Memory<float>** buffers_u = new Memory<float>*[D];
+		buffers_u[0] = &(lbm_domain[0]->u);
+		u = Memory_Container(this, buffers_u, "u");
+	} {
+		Memory<uchar>** buffers_flags = new Memory<uchar>*[D];
+		buffers_flags[0] = &(lbm_domain[0]->flags);
+		flags = Memory_Container(this, buffers_flags, "flags");
+	} {
+#ifdef FORCE_FIELD
+		Memory<float>** buffers_F = new Memory<float>*[D];
+		buffers_F[0] = &(lbm_domain[0]->F);
+		F = Memory_Container(this, buffers_F, "F");
+#endif // FORCE_FIELD
+	} {
+#ifdef SURFACE
+		Memory<float>** buffers_phi = new Memory<float>*[D];
+		buffers_phi[0] = &(lbm_domain[0]->phi);
+		phi = Memory_Container(this, buffers_phi, "phi");
+#endif // SURFACE
+	} {
+#ifdef TEMPERATURE
+		Memory<float>** buffers_T = new Memory<float>*[D];
+		buffers_T[0] = &(lbm_domain[0]->T);
+		T = Memory_Container(this, buffers_T, "T");
+#endif // TEMPERATURE
+	} {
+#ifdef PARTICLES
+		particles = &(lbm_domain[0]->particles);
+#endif // PARTICLES
+	}
+#ifdef GRAPHICS
+	graphics = Graphics(this);
+#endif // GRAPHICS
+}
 LBM::LBM(const uint Nx, const uint Ny, const uint Nz, const float nu, const float fx, const float fy, const float fz, const uint particles_N, const float particles_rho)
 	:LBM(Nx, Ny, Nz, 1u, 1u, 1u, nu, fx, fy, fz, 0.0f, 0.0f, 0.0f, particles_N, particles_rho) { // delegating constructor
 }

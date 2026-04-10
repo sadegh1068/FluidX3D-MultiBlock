@@ -3010,6 +3010,56 @@ string opencl_c_container() { return R( // ########################## begin of O
 )+"#endif"+R( // PARTICLES
 )+"#endif"+R( // GRAPHICS
 
+// ################################################## multi-block coupling kernels ##################################################
 
+)+R(kernel void coupling_c2f( // coarse→fine trilinear interpolation (GPU-side, no PCIe transfer)
+	const global float* rho_c, const global float* u_c, // coarse rho, u (read)
+	global float* rho_f, global float* u_f,             // fine rho, u (write)
+	const global uint* fine_ghost_idx,                   // fine ghost cell indices [N_ghost]
+	const global uint* interp_coarse_idx,                // 8 coarse source indices per ghost [N_ghost*8]
+	const global float* interp_w,                        // 8 weights per ghost [N_ghost*8]
+	const ulong cN, const ulong fN, const uint N_ghost
+) {
+	const uint i = get_global_id(0);
+	if(i >= N_ghost) return;
+	const uint nf = fine_ghost_idx[i];
+	float rho_interp=0.0f, ux_interp=0.0f, uy_interp=0.0f, uz_interp=0.0f;
+	for(uint s=0u; s<8u; s++) {
+		const uint nc = interp_coarse_idx[i*8u+s];
+		const float w = interp_w[i*8u+s];
+		rho_interp += w * rho_c[nc];
+		ux_interp  += w * u_c[nc];
+		uy_interp  += w * u_c[cN+(ulong)nc];
+		uz_interp  += w * u_c[2ul*cN+(ulong)nc];
+	}
+	rho_f[nf]              = rho_interp;
+	u_f[nf]                = ux_interp;
+	u_f[fN+(ulong)nf]      = uy_interp;
+	u_f[2ul*fN+(ulong)nf]  = uz_interp;
+}
+)+R(kernel void coupling_f2c( // fine→coarse volume averaging (GPU-side, no PCIe transfer)
+	const global float* rho_f, const global float* u_f, // fine rho, u (read)
+	global float* rho_c, global float* u_c,             // coarse rho, u (write)
+	const global uint* coarse_iface_idx,                 // coarse interface cell indices [N_iface]
+	const global uint* avg_fine_children,                // 8 fine child indices per iface [N_iface*8]
+	const ulong cN, const ulong fN, const uint N_iface
+) {
+	const uint i = get_global_id(0);
+	if(i >= N_iface) return;
+	const uint nc = coarse_iface_idx[i];
+	float rho_avg=0.0f, ux_avg=0.0f, uy_avg=0.0f, uz_avg=0.0f;
+	for(uint s=0u; s<8u; s++) {
+		const uint nf = avg_fine_children[i*8u+s];
+		rho_avg += rho_f[nf];
+		ux_avg  += u_f[nf];
+		uy_avg  += u_f[fN+(ulong)nf];
+		uz_avg  += u_f[2ul*fN+(ulong)nf];
+	}
+	rho_c[nc]              = rho_avg * 0.125f;
+	u_c[nc]                = ux_avg  * 0.125f;
+	u_c[cN+(ulong)nc]      = uy_avg  * 0.125f;
+	u_c[2ul*cN+(ulong)nc]  = uz_avg  * 0.125f;
+}
+)+R(
 
 );} // ############################################################### end of OpenCL C code #####################################################################

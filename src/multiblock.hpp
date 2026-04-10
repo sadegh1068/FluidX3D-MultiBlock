@@ -34,38 +34,34 @@ private:
 	float nu_c, nu_f; // lattice viscosities (nu_f = 2 * nu_c)
 	float tau_c, tau_f;
 
-	ulong t_coarse = 0ull; // coarse timestep counter (for Esoteric-Pull parity)
-	ulong t_fine = 0ull; // fine timestep counter
+	ulong t_coarse = 0ull;
+	ulong t_fine = 0ull;
 
-	// Coupling cell index lists (host-side, built once at init)
-	vector<uint> coarse_interface_indices; // TYPE_E ring on coarse grid (receives F→C data)
-	vector<uint> fine_ghost_indices; // TYPE_Y ring on fine grid (receives C→F data)
-	vector<uint> coarse_extract_indices; // shell on coarse for interpolation source
+	// GPU-side coupling buffers and kernels (shared OpenCL context)
+	// Index arrays on device: list of cell indices for coupling
+	Memory<uint>* dev_fine_ghost_indices = nullptr; // fine ghost cell indices
+	Memory<uint>* dev_coarse_iface_indices = nullptr; // coarse interface cell indices
 
-	// Host coupling buffers: 4 floats per cell (rho, ux, uy, uz)
-	vector<float> buf_c2f_extract; // extracted coarse data at shell
-	vector<float> buf_c2f_interp; // interpolated data for fine ghost cells
-	vector<float> buf_f2c_extract; // extracted fine data at interface
-	vector<float> buf_f2c_avg; // averaged data for coarse interface cells
+	// Mapping arrays on device for trilinear interpolation
+	// For each fine ghost cell: 8 coarse source indices + 8 weights
+	Memory<uint>* dev_interp_coarse_indices = nullptr; // [N_ghost * 8] coarse cell indices
+	Memory<float>* dev_interp_weights = nullptr; // [N_ghost * 8] trilinear weights
 
-	// Coordinate mapping: fine ghost cell index → coarse fractional coords for interpolation
-	struct FineGhostMapping {
-		uint fine_idx; // linear index in fine grid
-		float cx, cy, cz; // fractional position in coarse grid
-	};
-	vector<FineGhostMapping> ghost_mappings;
+	// Mapping arrays on device for fine→coarse averaging
+	// For each coarse interface cell: 8 fine child indices
+	Memory<uint>* dev_avg_fine_children = nullptr; // [N_iface * 8] fine child indices
 
-	// Coordinate mapping: coarse interface cell → 8 fine children for averaging
-	struct CoarseInterfaceMapping {
-		uint coarse_idx; // linear index in coarse grid
-		uint fine_children[8]; // 8 fine cell indices that map to this coarse cell
-	};
-	vector<CoarseInterfaceMapping> interface_mappings;
+	uint n_fine_ghost = 0u;
+	uint n_coarse_iface = 0u;
 
-	void build_index_lists();
-	void flag_coarse_zone(); // set TYPE_Y interior + TYPE_E ring on coarse
-	void flag_fine_boundaries(); // set TYPE_Y on fine grid outer ring
+	// GPU coupling kernels (compiled in shared context)
+	Kernel* kernel_c2f = nullptr; // coarse→fine interpolation
+	Kernel* kernel_f2c = nullptr; // fine→coarse averaging
 
-	void interpolate_c2f(); // trilinear interp: coarse → fine ghost rho/u
-	void average_f2c(); // volume average: fine → coarse interface rho/u
+	void build_coupling_gpu();
+	void flag_coarse_zone();
+	void flag_fine_boundaries();
+
+	void gpu_push_c2f(); // run C→F kernel on GPU (no PCIe transfer)
+	void gpu_push_f2c(); // run F→C kernel on GPU (no PCIe transfer)
 };
