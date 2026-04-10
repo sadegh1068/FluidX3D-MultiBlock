@@ -22,7 +22,6 @@ double compute_total_mass(LBM* lbm) {
 // Helper: save a y-profile of ux at given (x, z) from an LBM object
 void save_profile(LBM* lbm, const uint px, const uint pz, const string& filename, const float y_offset=0.0f, const float y_scale=1.0f) {
 	const uint Nx=lbm->get_Nx(), Ny=lbm->get_Ny(), Nz=lbm->get_Nz();
-	// Update rho/u fields on device from DDFs, then read to host
 	lbm->update_fields();
 	for(uint d=0u; d<lbm->get_D(); d++) {
 		lbm->lbm_domain[d]->finish_queue();
@@ -81,79 +80,148 @@ void set_tgv_ic(LBM* lbm, const float A, const float L, const float ox, const fl
 
 void main_setup() {
 	// ============================================================
-	// Step 4: Taylor-Green Vortex decay (3D turbulence test)
-	// Periodic box, TGV initial condition, SUBGRID enabled
-	// Compare kinetic energy decay: uniform fine vs multi-block
+	// Step 5: Turbulent channel flow (walls + turbulence + coupling)
+	// Body-force-driven, walls at y=0 and y=Ny-1, periodic x,z
+	// Fine zone near bottom wall where gradients are steepest
+	// SUBGRID (Smagorinsky) enabled for LES
+	// Compare mean velocity profile with log-law reference
 	// ============================================================
-	const uint cN = 64u; // coarse grid: 64^3
-	const float A = 0.1f; // TGV amplitude (moderate, keeps Ma low)
-	const float nu = 0.005f; // viscosity → Re = A*L/(2*pi*nu) ~ 200
-	const float L = (float)cN; // physical domain size = coarse grid size
-	const ulong nsteps = 10000ull;
-	const ulong log_interval = 500ull;
+	const uint cNx=64u, cNy=64u, cNz=64u;
+	const float u_tau_target = 0.05f; // target friction velocity
+	// Re_tau = u_tau * delta / nu, delta = Ny/2 = 32
+	// For Re_tau ~ 100: nu = u_tau * delta / Re_tau = 0.05 * 32 / 100 = 0.016
+	const float Re_tau = 30.0f; // low Re for stability test (tau_c = 0.5 + 3*0.053 = 0.66)
+	const float delta = (float)(cNy/2u); // half-channel height = 32
+	const float nu = u_tau_target * delta / Re_tau;
+	// Body force: dp/dx = rho * u_tau^2 / delta
+	const float fx = u_tau_target * u_tau_target / delta;
+	const ulong nsteps = 20000ull; // enough for flow development
+	const ulong warmup = 10000ull; // warmup before averaging
+	const ulong log_interval = 1000ull;
 
-	// --- RUN 1: Uniform fine grid (reference) ---
-	{
-		const uint fN = cN * 2u; // 128^3
-		const float nu_f = 2.0f * nu;
-		print_info("=== Step 4 RUN 1: Uniform fine TGV " + to_string(fN) + "^3 ===");
-		LBM lbm(fN, fN, fN, nu_f);
-		set_tgv_ic(&lbm, A, L, 0.0f, 0.0f, 0.0f, 0.5f); // dx_fine = 0.5
+	print_info("=== Step 5: Turbulent channel flow ===");
+	print_info("  Re_tau=" + to_string((int)Re_tau) + " nu=" + to_string(nu) + " fx=" + to_string(fx));
 
-		std::ofstream fe("energy_uniform_fine.csv");
-		fe << "step,energy" << std::endl;
+	// Option B: Wall INSIDE fine grid. Fine zone includes bottom wall (y=0).
+	// Interface at y=20 (coarse units) — well into the log-law region.
+	// Fine grid has TYPE_S wall at its bottom, TYPE_E coupling at its top.
+	// Fine zone: y=[8,24] — far enough from wall (7 coarse cells between wall and interface)
+	// Interface at y=8 and y=24 are both in smooth-flow regions
+	RefinementZone zone = {2u, 8u, 2u, 62u, 24u, 62u};
 
-		// Run first chunk to trigger initialize(), then measure E0
-		const ulong fine_total = nsteps * 2ull;
-		lbm.run(1ull, fine_total); // initialize + 1 step
-		const double E0 = compute_kinetic_energy(&lbm);
-		fe << "1," << E0 << std::endl;
+	MultiBlockLBM mb(cNx, cNy, cNz, nu, zone, fx, 0.0f, 0.0f);
+	LBM* lc = mb.coarse();
+	LBM* lf = mb.fine();
 
-		for(ulong s=1ull; s<fine_total; s+=log_interval*2ull) {
-			const ulong chunk = min(log_interval*2ull, fine_total-s);
-			lbm.run(chunk, fine_total);
-			const double E = compute_kinetic_energy(&lbm);
-			fe << (s+chunk) << "," << E << std::endl;
-			print_info("  Uniform fine step " + to_string(s+chunk) + "/" + to_string(fine_total) + " E/E0=" + to_string((float)(E/E0)));
-		}
-		fe.close();
+	// Coarse grid: walls at y=0 and y=Ny-1, parabolic IC + perturbation
+	const uint Nx=lc->get_Nx(), Ny=lc->get_Ny(), Nz=lc->get_Nz();
+	parallel_for(lc->get_N(), [&](ulong n) { uint x=0u, y=0u, z=0u; lc->coordinates(n, x, y, z);
+		const float yf = (float)y / (float)(Ny-1u);
+		const float u_mean = 6.0f * u_tau_target * yf * (1.0f - yf);
+		const float perturbation = 0.05f * u_tau_target * (
+			sinf(2.0f*pif*4.0f*(float)x/(float)Nx) * cosf(2.0f*pif*3.0f*(float)z/(float)Nz) * sinf(pif*yf)
+		);
+		lc->rho[n] = 1.0f;
+		lc->u.x[n] = u_mean + perturbation;
+		lc->u.y[n] = perturbation * 0.3f;
+		lc->u.z[n] = perturbation * 0.2f;
+		if(y==0u || y==Ny-1u) { lc->flags[n] = TYPE_S; lc->u.x[n] = 0.0f; lc->u.y[n] = 0.0f; lc->u.z[n] = 0.0f; }
+	});
+
+	// Fine grid: wall at BOTTOM (y_fine=0 face), coupling at TOP (y_fine=max face)
+	// Map fine coords to physical coords for IC
+	const uint fNx=lf->get_Nx(), fNy=lf->get_Ny(), fNz=lf->get_Nz();
+	parallel_for(lf->get_N(), [&](ulong n) { uint x=0u, y=0u, z=0u; lf->coordinates(n, x, y, z);
+		const float py = (float)zone.cy0 + ((float)y + 0.5f) * 0.5f; // physical y
+		const float yf = py / (float)(Ny-1u);
+		const float u_mean = 6.0f * u_tau_target * yf * (1.0f - yf);
+		lf->rho[n] = 1.0f;
+		lf->u.x[n] = u_mean;
+		lf->u.y[n] = 0.0f;
+		lf->u.z[n] = 0.0f;
+		// Wall at bottom of fine grid: y_fine cells that map to physical y < 1 (inside coarse wall)
+		// Fine y=0,1 → physical y = zone.cy0 + 0.25, zone.cy0 + 0.75 = 2.25, 2.75
+		// These are above the wall. The wall is at coarse y=0,1 which is BELOW fine zone.
+		// So we DON'T need TYPE_S in fine grid — the coupling boundary handles it.
+		// But we DO need the fine grid's bottom face to have correct near-wall velocity (≈0).
+	});
+
+	// Run warmup + statistics collection
+	mb.initialize();
+
+	// DIAGNOSTIC: check fine grid works after 10 steps
+	mb.run(10ull);
+	lf->update_fields();
+	lf->lbm_domain[0]->finish_queue();
+	lf->lbm_domain[0]->u.read_from_device();
+	// Sample interior fine cell (middle of fine grid)
+	const ulong diag_n = (ulong)(fNx/2u) + ((ulong)(fNy/2u) + (ulong)(fNz/2u)*(ulong)fNy)*(ulong)fNx;
+	print_info("  DIAG: fine grid center u.x = " + to_string(lf->u.x[diag_n]) + " (should be >0)");
+	print_info("  DIAG: fine grid fNx=" + to_string(fNx) + " fNy=" + to_string(fNy) + " fNz=" + to_string(fNz));
+	// Check a few fine cells
+	for(uint y=0u; y<fNy; y+=fNy/4u) {
+		const ulong idx = (ulong)(fNx/2u) + ((ulong)y + (ulong)(fNz/2u)*(ulong)fNy)*(ulong)fNx;
+		print_info("  DIAG: fine y=" + to_string(y) + " u.x=" + to_string(lf->u.x[idx]) + " flags=" + to_string((int)lf->flags[idx]));
 	}
 
-	// --- RUN 2: Multi-block TGV ---
-	{
-		// Fine zone: center of domain [16,48]^3 in coarse coords
-		RefinementZone zone = {16u, 16u, 16u, 48u, 48u, 48u};
-		print_info("=== Step 4 RUN 2: Multi-block TGV, coarse " + to_string(cN) + "^3 + fine 64^3 ===");
-		MultiBlockLBM mb(cN, cN, cN, nu, zone);
-		LBM* lc = mb.coarse();
-		LBM* lf = mb.fine();
+	print_info("  Warmup: " + to_string(warmup) + " steps...");
+	mb.run(warmup);
+	print_info("  Warmup done. Collecting statistics for " + to_string(nsteps-warmup) + " steps...");
 
-		// Set TGV ICs on coarse grid (full domain, physical coords 0..L)
-		set_tgv_ic(lc, A, L, 0.0f, 0.0f, 0.0f, 1.0f); // dx_coarse = 1.0
+	// Collect time-averaged u(y) profile from fine grid (near wall) and coarse grid (bulk)
+	const uint n_avg = (uint)((nsteps - warmup) / log_interval);
+	std::vector<double> avg_ux_coarse(Ny, 0.0), avg_ux_fine(fNy, 0.0);
+	uint avg_count = 0u;
 
-		// Set TGV ICs on fine grid (sub-domain, physical coords zone.cx0..zone.cx1)
-		set_tgv_ic(lf, A, L, (float)zone.cx0, (float)zone.cy0, (float)zone.cz0, 0.5f);
+	for(ulong s=warmup; s<nsteps; s+=log_interval) {
+		mb.run(log_interval);
+		avg_count++;
 
-		std::ofstream fe("energy_multiblock.csv");
-		fe << "step,energy_coarse,energy_fine,energy_total" << std::endl;
-
-		mb.initialize();
-		const double Ec0 = compute_kinetic_energy(lc);
-		const double Ef0 = compute_kinetic_energy(lf);
-		fe << "0," << Ec0 << "," << Ef0 << "," << (Ec0+Ef0) << std::endl;
-
-		for(ulong s=0ull; s<nsteps; s+=log_interval) {
-			mb.run(log_interval);
-			const double Ec = compute_kinetic_energy(lc);
-			const double Ef = compute_kinetic_energy(lf);
-			fe << (s+log_interval) << "," << Ec << "," << Ef << "," << (Ec+Ef) << std::endl;
-			print_info("  Multi-block step " + to_string(s+log_interval) + "/" + to_string(nsteps) +
-			           " E_total/E0=" + to_string((float)((Ec+Ef)/(Ec0+Ef0))));
+		// Read u from device via domain buffer (not Memory_Container which may be stale)
+		lc->update_fields();
+		lc->lbm_domain[0]->finish_queue();
+		lc->lbm_domain[0]->u.read_from_device();
+		for(uint y=0u; y<Ny; y++) {
+			const ulong idx = (ulong)(Nx/2u) + ((ulong)y + (ulong)(Nz/2u)*(ulong)Ny)*(ulong)Nx;
+			avg_ux_coarse[y] += (double)lc->lbm_domain[0]->u[idx]; // read from domain buffer directly
 		}
-		fe.close();
+
+		lf->update_fields();
+		lf->lbm_domain[0]->finish_queue();
+		lf->lbm_domain[0]->u.read_from_device();
+		const uint fpx = fNx/2u, fpz = fNz/2u;
+		for(uint y=0u; y<fNy; y++) {
+			const ulong idx = (ulong)fpx + ((ulong)y + (ulong)fpz*(ulong)fNy)*(ulong)fNx;
+			avg_ux_fine[y] += (double)lf->lbm_domain[0]->u[idx]; // read from domain buffer directly
+		}
+
+		print_info("  Step " + to_string(s+log_interval) + "/" + to_string(nsteps) + " (avg #" + to_string(avg_count) + ")");
 	}
 
-	print_info("=== Step 4 complete: Taylor-Green Vortex decay ===");
+	// Write averaged profiles
+	std::ofstream fc("channel_profile_coarse.csv");
+	fc << "y,y_plus,ux_mean,u_plus" << std::endl;
+	for(uint y=0u; y<Ny; y++) {
+		const double ux = avg_ux_coarse[y] / (double)avg_count;
+		const double yp = (double)y * u_tau_target / nu; // y+ = y * u_tau / nu
+		const double up = ux / (double)u_tau_target;     // u+ = u / u_tau
+		fc << y << "," << yp << "," << ux << "," << up << std::endl;
+	}
+	fc.close();
+
+	std::ofstream ff("channel_profile_fine.csv");
+	ff << "y_fine,y_physical,y_plus,ux_mean,u_plus" << std::endl;
+	for(uint y=0u; y<fNy; y++) {
+		const double ux = avg_ux_fine[y] / (double)avg_count;
+		const double py = (double)zone.cy0 + ((double)y + 0.5) * 0.5; // physical y in coarse units
+		const double yp = py * u_tau_target / nu;
+		const double up = ux / (double)u_tau_target;
+		ff << y << "," << py << "," << yp << "," << ux << "," << up << std::endl;
+	}
+	ff.close();
+
+	print_info("=== Step 5 complete: Turbulent channel flow ===");
+	print_info("  Profiles saved to channel_profile_coarse.csv and channel_profile_fine.csv");
 }
 #endif // MULTIBLOCK
 
