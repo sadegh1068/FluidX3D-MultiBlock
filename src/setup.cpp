@@ -6,6 +6,18 @@
 #include "multiblock.hpp"
 #include <fstream>
 
+// Helper: compute total mass (sum of rho) on an LBM object — reads from device
+double compute_total_mass(LBM* lbm) {
+	lbm->update_fields();
+	for(uint d=0u; d<lbm->get_D(); d++) {
+		lbm->lbm_domain[d]->finish_queue();
+		lbm->lbm_domain[d]->rho.read_from_device();
+	}
+	double mass = 0.0;
+	for(ulong n=0ull; n<lbm->get_N(); n++) mass += (double)lbm->rho[n];
+	return mass;
+}
+
 // Helper: save a y-profile of ux at given (x, z) from an LBM object
 void save_profile(LBM* lbm, const uint px, const uint pz, const string& filename, const float y_offset=0.0f, const float y_scale=1.0f) {
 	const uint Nx=lbm->get_Nx(), Ny=lbm->get_Ny(), Nz=lbm->get_Nz();
@@ -29,61 +41,89 @@ void save_profile(LBM* lbm, const uint px, const uint pz, const string& filename
 
 void main_setup() {
 	// ============================================================
-	// Validation: Poiseuille flow — uniform fine vs multi-block
-	// Channel: walls at y=0 and y=Ny-1, pressure-driven in x
-	// Physical domain: 200 x 60 x 4 (coarse units), quasi-2D in z
+	// Steps 1+2: Mass conservation + 3D Poiseuille validation
+	// Body-force-driven channel, fully 3D (64x64x64 coarse)
+	// u_analytical(y) = fx/(2*nu) * y * (H-y), H = Ny-1
 	// ============================================================
-	// Body-force-driven Poiseuille: u(y) = fx/(2*nu) * y * (H-y), H=Ny-1
-	const uint cNx=64u, cNy=64u, cNz=8u;
+	const uint cNx=64u, cNy=64u, cNz=64u; // fully 3D
 	const float nu = 0.1f;
-	const float fx = 1.0e-5f; // body force in x
-	const ulong nsteps = 50000ull; // t_steady ~ 63^2/0.1 = 39690
+	const float fx = 1.0e-5f;
+	const ulong nsteps = 50000ull; // >1x t_steady (63^2/0.1 = 39690)
+	const ulong log_interval = 5000ull; // log mass every 5K coarse steps
 
 	// --- RUN 1: Uniform fine grid (reference) ---
-	// Same physical domain at 2x resolution
 	{
 		const uint fNx=cNx*2u, fNy=cNy*2u, fNz=cNz*2u;
 		const float nu_fine = 2.0f * nu;
-		// Force scaling: F_phys = F_lbm * dx/dt^2. With dx_f=dx_c/2, dt_f=dt_c/2: F_f = F_c/2
-		const float fx_fine = fx * 0.5f;
+		const float fx_fine = fx * 0.5f; // F_f = F_c/2 for same physical force
 		print_info("=== RUN 1: Uniform fine grid " + to_string(fNx) + "x" + to_string(fNy) + "x" + to_string(fNz) + " ===");
 		LBM lbm(fNx, fNy, fNz, nu_fine, fx_fine, 0.0f, 0.0f);
 		const uint Ny=lbm.get_Ny();
 		parallel_for(lbm.get_N(), [&](ulong n) { uint x=0u, y=0u, z=0u; lbm.coordinates(n, x, y, z);
 			lbm.rho[n] = 1.0f;
 			lbm.u.x[n] = 0.0f; lbm.u.y[n] = 0.0f; lbm.u.z[n] = 0.0f;
-			if(y==0u || y==Ny-1u) lbm.flags[n] = TYPE_S; // walls, periodic in x and z
+			if(y==0u || y==Ny-1u) lbm.flags[n] = TYPE_S;
 		});
-		lbm.run(nsteps * 2ull); // fine grid runs 2x steps for same physical time
+		// Mass monitoring for uniform fine
+		const double mass0_uf = (double)lbm.get_N(); // initial mass = N * rho_init(=1)
+		std::ofstream fmass_uf("mass_uniform_fine.csv");
+		fmass_uf << "step,mass,mass_drift_pct" << std::endl;
+		fmass_uf << "0," << mass0_uf << ",0.0" << std::endl;
+		const ulong fine_total = nsteps * 2ull;
+		for(ulong s=0ull; s<fine_total; s+=log_interval*2ull) {
+			const ulong chunk = min(log_interval*2ull, fine_total-s);
+			lbm.run(chunk, fine_total);
+			const double mass = compute_total_mass(&lbm);
+			const double drift = 100.0 * (mass - mass0_uf) / mass0_uf;
+			fmass_uf << (s+chunk) << "," << mass << "," << drift << std::endl;
+			print_info("  Uniform fine step " + to_string(s+chunk) + "/" + to_string(fine_total) + " mass_drift=" + to_string((float)drift) + "%");
+		}
+		fmass_uf.close();
 		save_profile(&lbm, lbm.get_Nx()/2u, lbm.get_Nz()/2u, "profile_uniform_fine.csv", 0.0f, 0.5f);
 	}
 
-	// --- RUN 2: Multi-block (coarse + fine zone in center) ---
+	// --- RUN 2: Multi-block with mass monitoring ---
 	{
-		// Fine zone: x=[40,160], y=[10,50], z=[0,4] in coarse coords
-		// This covers most of the channel height, leaving walls in the coarse region
-		RefinementZone zone = {16u, 16u, 2u, 48u, 48u, 6u}; // fine zone in channel center
-		print_info("=== RUN 2: Multi-block, coarse=" + to_string(cNx) + "x" + to_string(cNy) + "x" + to_string(cNz) +
+		RefinementZone zone = {16u, 16u, 16u, 48u, 48u, 48u}; // fine zone in center, fully 3D
+		print_info("=== RUN 2: Multi-block 3D, coarse=" + to_string(cNx) + "x" + to_string(cNy) + "x" + to_string(cNz) +
 		           " fine=" + to_string((zone.cx1-zone.cx0)*2u) + "x" + to_string((zone.cy1-zone.cy0)*2u) + "x" + to_string((zone.cz1-zone.cz0)*2u) + " ===");
 		MultiBlockLBM mb(cNx, cNy, cNz, nu, zone, fx, 0.0f, 0.0f);
 		LBM* lc = mb.coarse();
 		LBM* lf = mb.fine();
 
-		// Coarse grid: walls at y boundaries, periodic in x,z (default)
 		const uint Ny=lc->get_Ny();
 		parallel_for(lc->get_N(), [&](ulong n) { uint x=0u, y=0u, z=0u; lc->coordinates(n, x, y, z);
 			lc->rho[n] = 1.0f;
 			lc->u.x[n] = 0.0f; lc->u.y[n] = 0.0f; lc->u.z[n] = 0.0f;
-			if(y==0u || y==Ny-1u) lc->flags[n] = TYPE_S; // walls
+			if(y==0u || y==Ny-1u) lc->flags[n] = TYPE_S;
 		});
-
-		// Fine grid: default init (no walls needed — walls are in coarse region)
 		parallel_for(lf->get_N(), [&](ulong n) { uint x=0u, y=0u, z=0u; lf->coordinates(n, x, y, z);
 			lf->rho[n] = 1.0f;
 			lf->u.x[n] = 0.0f; lf->u.y[n] = 0.0f; lf->u.z[n] = 0.0f;
 		});
 
-		mb.run(nsteps);
+		// Mass monitoring: log coarse + fine mass every log_interval steps
+		std::ofstream fmass_mb("mass_multiblock.csv");
+		fmass_mb << "step,mass_coarse,mass_fine,mass_total,mass_drift_pct" << std::endl;
+		// Initial mass = coarse_fluid_cells * 1.0 + fine_cells * 1.0
+		// (TYPE_Y coarse cells are skipped but still have rho=1 in memory — exclude them from mass)
+		mb.initialize();
+		const double mass0_c = compute_total_mass(lc);
+		const double mass0_f = compute_total_mass(lf);
+		const double mass0_total = mass0_c + mass0_f;
+		fmass_mb << "0," << mass0_c << "," << mass0_f << "," << mass0_total << ",0.0" << std::endl;
+
+		for(ulong s=0ull; s<nsteps; s+=log_interval) {
+			const ulong chunk = min(log_interval, nsteps-s);
+			mb.run(chunk);
+			const double mc = compute_total_mass(lc);
+			const double mf = compute_total_mass(lf);
+			const double mt = mc + mf;
+			const double drift = 100.0 * (mt - mass0_total) / mass0_total;
+			fmass_mb << (s+chunk) << "," << mc << "," << mf << "," << mt << "," << drift << std::endl;
+			print_info("  Multi-block step " + to_string(s+chunk) + "/" + to_string(nsteps) + " mass_drift=" + to_string((float)drift) + "%");
+		}
+		fmass_mb.close();
 
 		// Extract profiles
 		save_profile(lc, lc->get_Nx()/2u, lc->get_Nz()/2u, "profile_multiblock_coarse.csv", 0.0f, 1.0f);
@@ -92,7 +132,7 @@ void main_setup() {
 		save_profile(lf, fine_px, fine_pz, "profile_multiblock_fine.csv", (float)zone.cy0, 0.5f);
 	}
 
-	print_info("=== Validation complete. Compare CSV files. ===");
+	print_info("=== Steps 1+2 complete: Mass conservation + 3D Poiseuille ===");
 }
 #endif // MULTIBLOCK
 

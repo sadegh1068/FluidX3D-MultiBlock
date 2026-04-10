@@ -32,8 +32,9 @@ MultiBlockLBM::MultiBlockLBM(
 	const Device_Info shared_device = select_device_with_most_flops();
 
 	// Create both LBM objects using the shared device context
+	// Force scaling: F_phys = F_lbm * dx/dt^2. With dx_f=dx_c/2, dt_f=dt_c/2: F_f = F_c/2
 	lbm_c = new LBM(shared_device, cNx, cNy, cNz, nu_c, fx, fy, fz);
-	lbm_f = new LBM(shared_device, fNx, fNy, fNz, nu_f, fx, fy, fz);
+	lbm_f = new LBM(shared_device, fNx, fNy, fNz, nu_f, fx*0.5f, fy*0.5f, fz*0.5f);
 
 	print_info("MultiBlockLBM: shared OpenCL context — GPU-side coupling enabled");
 }
