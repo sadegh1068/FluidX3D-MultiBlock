@@ -2,6 +2,48 @@
 
 
 
+#ifdef MULTIBLOCK
+#include "multiblock.hpp"
+void main_setup() { // multi-block test: Poiseuille flow through 2-level refinement zone
+	// Coarse grid: 200x60x60, fine zone in the center
+	const uint cNx=200u, cNy=60u, cNz=60u;
+	const float nu = 0.02f;
+
+	// Fine zone: x=[60,140], y=[20,40], z=[20,40] in coarse coords (all even)
+	RefinementZone zone = {60u, 20u, 20u, 140u, 40u, 40u};
+
+	MultiBlockLBM mb(cNx, cNy, cNz, nu, zone);
+	LBM* lc = mb.coarse();
+	LBM* lf = mb.fine();
+
+	// Initialize coarse grid: uniform flow + walls at y=0, y=Ny-1
+	const uint Nx=lc->get_Nx(), Ny=lc->get_Ny(), Nz=lc->get_Nz();
+	parallel_for(lc->get_N(), [&](ulong n) { uint x=0u, y=0u, z=0u; lc->coordinates(n, x, y, z);
+		lc->rho[n] = 1.0f;
+		lc->u.x[n] = 0.0f;
+		lc->u.y[n] = 0.0f;
+		lc->u.z[n] = 0.0f;
+		if(y==0u || y==Ny-1u) lc->flags[n] = TYPE_S; // walls
+		if(x==0u) { lc->flags[n] = TYPE_E; lc->rho[n] = 1.001f; } // pressure inlet
+		if(x==Nx-1u) { lc->flags[n] = TYPE_E; lc->rho[n] = 1.0f; } // pressure outlet
+	});
+
+	// Initialize fine grid: uniform, walls at corresponding y positions
+	const uint fNx=lf->get_Nx(), fNy=lf->get_Ny(), fNz=lf->get_Nz();
+	parallel_for(lf->get_N(), [&](ulong n) { uint x=0u, y=0u, z=0u; lf->coordinates(n, x, y, z);
+		lf->rho[n] = 1.0f;
+		lf->u.x[n] = 0.0f;
+		lf->u.y[n] = 0.0f;
+		lf->u.z[n] = 0.0f;
+	});
+
+	// Run 1000 coarse steps
+	print_info("Starting multi-block Poiseuille flow test...");
+	mb.run(1000ull);
+	print_info("Multi-block test complete. t_coarse=" + to_string(mb.coarse()->get_t()));
+}
+#endif // MULTIBLOCK
+
 #ifdef BENCHMARK
 #include "info.hpp"
 void main_setup() { // benchmark; required extensions in defines.hpp: BENCHMARK, optionally FP16S or FP16C

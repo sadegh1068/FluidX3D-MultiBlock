@@ -205,7 +205,10 @@ public:
 
 
 
+class MultiBlockLBM; // forward declaration
+
 class LBM {
+	friend class MultiBlockLBM; // allow MultiBlockLBM access to private members (do_time_step, initialize, lbm_domain)
 private:
 	uint Nx=1u, Ny=1u, Nz=1u; // (global) lattice dimensions
 	uint Dx=1u, Dy=1u, Dz=1u; // lattice domains

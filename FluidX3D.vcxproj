@@ -64,6 +64,7 @@
     <ClCompile Include="src\lbm.cpp" />
     <ClCompile Include="src\lodepng.cpp" />
     <ClCompile Include="src\main.cpp" />
+    <ClCompile Include="src\multiblock.cpp" />
     <ClCompile Include="src\setup.cpp" />
     <ClCompile Include="src\shapes.cpp" />
   </ItemGroup>
@@ -73,6 +74,7 @@
     <ClInclude Include="src\info.hpp" />
     <ClInclude Include="src\kernel.hpp" />
     <ClInclude Include="src\lbm.hpp" />
+    <ClInclude Include="src\multiblock.hpp" />
     <ClInclude Include="src\lodepng.hpp" />
     <ClInclude Include="src\opencl.hpp" />
     <ClInclude Include="src\setup.hpp" />

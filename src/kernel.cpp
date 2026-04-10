@@ -1478,6 +1478,7 @@ string opencl_c_container() { return R( // ########################## begin of O
 	const uchar flagsn = flags[n]; // cache flags[n] for multiple readings
 	const uchar flagsn_bo=flagsn&TYPE_BO, flagsn_su=flagsn&TYPE_SU; // extract boundary and surface flags
 	if(flagsn_bo==TYPE_S||flagsn_su==TYPE_G) return; // if cell is solid boundary or gas, just return
+	if(flagsn&TYPE_Y) return; // MULTIBLOCK: skip coarse cells covered by fine grid, or fine ghost cells written by coupling
 
 	uxx j[def_velocity_set]; // neighbor indices
 	neighbors(n, j); // calculate neighbor indices
