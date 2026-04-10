@@ -168,7 +168,7 @@ void MultiBlockLBM::flag_fine_boundaries() {
 		                          y==0u || y==fNy-1u ||
 		                          z==0u || z==fNz-1u);
 		if(on_boundary) {
-			lbm_f->flags[n] = TYPE_Y; // ghost ring: DDFs written by coupling, skipped by stream_collide
+			lbm_f->flags[n] = TYPE_E; // ghost ring: TYPE_E reads stored rho/u and sets DDFs=feq
 		}
 	});
 }
@@ -266,15 +266,20 @@ void MultiBlockLBM::initialize() {
 void MultiBlockLBM::run(const ulong coarse_steps) {
 	if(!lbm_c->initialized) initialize();
 
-	for(ulong step=0ull; step<coarse_steps; step++) {
-		// === Step 1: C→F coupling (use current coarse data) ===
-		// Read coarse rho/u from device to host
+	// Helper lambdas for coupling transfers (read-modify-write only coupling cells)
+	auto push_c2f = [&]() { // interpolate coarse→fine ghost cells, write rho/u to fine device
+		// Read coarse rho/u from device
 		for(uint d=0u; d<lbm_c->get_D(); d++) {
 			lbm_c->lbm_domain[d]->rho.read_from_device();
 			lbm_c->lbm_domain[d]->u.read_from_device();
 		}
 		interpolate_c2f();
-		// Write interpolated data to fine ghost cells on host, then push to device
+		// Read fine rho/u from device (so we don't overwrite interior cells)
+		for(uint d=0u; d<lbm_f->get_D(); d++) {
+			lbm_f->lbm_domain[d]->rho.read_from_device();
+			lbm_f->lbm_domain[d]->u.read_from_device();
+		}
+		// Modify ONLY ghost cells on host
 		for(uint i=0u; i<(uint)fine_ghost_indices.size(); i++) {
 			const ulong nf = (ulong)fine_ghost_indices[i];
 			lbm_f->rho[nf]  = buf_c2f_interp[i*4u+0u];
@@ -282,76 +287,64 @@ void MultiBlockLBM::run(const ulong coarse_steps) {
 			lbm_f->u.y[nf]  = buf_c2f_interp[i*4u+2u];
 			lbm_f->u.z[nf]  = buf_c2f_interp[i*4u+3u];
 		}
+		// Write full arrays back (now only ghost cells differ from device state)
 		for(uint d=0u; d<lbm_f->get_D(); d++) {
 			lbm_f->lbm_domain[d]->rho.write_to_device();
 			lbm_f->lbm_domain[d]->u.write_to_device();
 		}
+	};
+
+	auto push_f2c = [&]() { // average fine→coarse interface cells, write rho/u to coarse device
+		// Read fine rho/u from device
+		for(uint d=0u; d<lbm_f->get_D(); d++) {
+			lbm_f->lbm_domain[d]->rho.read_from_device();
+			lbm_f->lbm_domain[d]->u.read_from_device();
+		}
+		average_f2c();
+		// Read coarse rho/u from device (so we don't overwrite non-interface cells)
+		for(uint d=0u; d<lbm_c->get_D(); d++) {
+			lbm_c->lbm_domain[d]->rho.read_from_device();
+			lbm_c->lbm_domain[d]->u.read_from_device();
+		}
+		// Modify ONLY interface cells on host
+		for(uint i=0u; i<(uint)coarse_interface_indices.size(); i++) {
+			const ulong nc = (ulong)coarse_interface_indices[i];
+			lbm_c->rho[nc]  = buf_f2c_avg[i*4u+0u];
+			lbm_c->u.x[nc]  = buf_f2c_avg[i*4u+1u];
+			lbm_c->u.y[nc]  = buf_f2c_avg[i*4u+2u];
+			lbm_c->u.z[nc]  = buf_f2c_avg[i*4u+3u];
+		}
+		// Write full arrays back
+		for(uint d=0u; d<lbm_c->get_D(); d++) {
+			lbm_c->lbm_domain[d]->rho.write_to_device();
+			lbm_c->lbm_domain[d]->u.write_to_device();
+		}
+	};
+
+	for(ulong step=0ull; step<coarse_steps; step++) {
+		// === Step 1: C→F coupling (use current coarse data) ===
+		push_c2f();
 
 		// === Step 2: Fine sub-step 1 ===
 		lbm_f->do_time_step();
 		t_fine++;
 
 		// === Step 3: F→C coupling (restrict fine → coarse interface) ===
-		for(uint d=0u; d<lbm_f->get_D(); d++) {
-			lbm_f->lbm_domain[d]->rho.read_from_device();
-			lbm_f->lbm_domain[d]->u.read_from_device();
-		}
-		average_f2c();
-		for(uint i=0u; i<(uint)coarse_interface_indices.size(); i++) {
-			const ulong nc = (ulong)coarse_interface_indices[i];
-			lbm_c->rho[nc]  = buf_f2c_avg[i*4u+0u];
-			lbm_c->u.x[nc]  = buf_f2c_avg[i*4u+1u];
-			lbm_c->u.y[nc]  = buf_f2c_avg[i*4u+2u];
-			lbm_c->u.z[nc]  = buf_f2c_avg[i*4u+3u];
-		}
-		for(uint d=0u; d<lbm_c->get_D(); d++) {
-			lbm_c->lbm_domain[d]->rho.write_to_device();
-			lbm_c->lbm_domain[d]->u.write_to_device();
-		}
+		push_f2c();
 
 		// === Step 4: Coarse step (with fresh interface data) ===
 		lbm_c->do_time_step();
 		t_coarse++;
 
 		// === Step 5: C→F coupling again (use NEW coarse data post-step) ===
-		for(uint d=0u; d<lbm_c->get_D(); d++) {
-			lbm_c->lbm_domain[d]->rho.read_from_device();
-			lbm_c->lbm_domain[d]->u.read_from_device();
-		}
-		interpolate_c2f();
-		for(uint i=0u; i<(uint)fine_ghost_indices.size(); i++) {
-			const ulong nf = (ulong)fine_ghost_indices[i];
-			lbm_f->rho[nf]  = buf_c2f_interp[i*4u+0u];
-			lbm_f->u.x[nf]  = buf_c2f_interp[i*4u+1u];
-			lbm_f->u.y[nf]  = buf_c2f_interp[i*4u+2u];
-			lbm_f->u.z[nf]  = buf_c2f_interp[i*4u+3u];
-		}
-		for(uint d=0u; d<lbm_f->get_D(); d++) {
-			lbm_f->lbm_domain[d]->rho.write_to_device();
-			lbm_f->lbm_domain[d]->u.write_to_device();
-		}
+		push_c2f();
 
 		// === Step 6: Fine sub-step 2 ===
 		lbm_f->do_time_step();
 		t_fine++;
 
 		// === Step 7: F→C coupling (final restriction) ===
-		for(uint d=0u; d<lbm_f->get_D(); d++) {
-			lbm_f->lbm_domain[d]->rho.read_from_device();
-			lbm_f->lbm_domain[d]->u.read_from_device();
-		}
-		average_f2c();
-		for(uint i=0u; i<(uint)coarse_interface_indices.size(); i++) {
-			const ulong nc = (ulong)coarse_interface_indices[i];
-			lbm_c->rho[nc]  = buf_f2c_avg[i*4u+0u];
-			lbm_c->u.x[nc]  = buf_f2c_avg[i*4u+1u];
-			lbm_c->u.y[nc]  = buf_f2c_avg[i*4u+2u];
-			lbm_c->u.z[nc]  = buf_f2c_avg[i*4u+3u];
-		}
-		for(uint d=0u; d<lbm_c->get_D(); d++) {
-			lbm_c->lbm_domain[d]->rho.write_to_device();
-			lbm_c->lbm_domain[d]->u.write_to_device();
-		}
+		push_f2c();
 	}
 
 	// Final sync
