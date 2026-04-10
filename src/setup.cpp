@@ -4,6 +4,7 @@
 
 #ifdef MULTIBLOCK
 #include "multiblock.hpp"
+#include "shapes.hpp"
 #include <fstream>
 
 // Helper: compute total mass (sum of rho) on an LBM object — reads from device
@@ -41,98 +42,110 @@ void save_profile(LBM* lbm, const uint px, const uint pz, const string& filename
 
 void main_setup() {
 	// ============================================================
-	// Steps 1+2: Mass conservation + 3D Poiseuille validation
-	// Body-force-driven channel, fully 3D (64x64x64 coarse)
-	// u_analytical(y) = fx/(2*nu) * y * (H-y), H = Ny-1
+	// Step 3: Flow past sphere at Re=300
+	// Sphere (D=20 coarse cells) inside fine zone
+	// Inlet velocity u=0.05, nu chosen for Re=u*D/nu=300
+	// Reference Cd ~0.656 (Clift, Grace & Weber)
 	// ============================================================
-	const uint cNx=64u, cNy=64u, cNz=64u; // fully 3D
-	const float nu = 0.1f;
-	const float fx = 1.0e-5f;
-	const ulong nsteps = 50000ull; // >1x t_steady (63^2/0.1 = 39690)
-	const ulong log_interval = 5000ull; // log mass every 5K coarse steps
+	const float u_in = 0.05f; // inlet velocity (lattice units)
+	const float D_sphere = 20.0f; // sphere diameter in coarse cells
+	const float Re = 300.0f;
+	const float nu = u_in * D_sphere / Re; // = 0.05*20/300 = 0.003333
 
-	// --- RUN 1: Uniform fine grid (reference) ---
-	{
-		const uint fNx=cNx*2u, fNy=cNy*2u, fNz=cNz*2u;
-		const float nu_fine = 2.0f * nu;
-		const float fx_fine = fx * 0.5f; // F_f = F_c/2 for same physical force
-		print_info("=== RUN 1: Uniform fine grid " + to_string(fNx) + "x" + to_string(fNy) + "x" + to_string(fNz) + " ===");
-		LBM lbm(fNx, fNy, fNz, nu_fine, fx_fine, 0.0f, 0.0f);
-		const uint Ny=lbm.get_Ny();
-		parallel_for(lbm.get_N(), [&](ulong n) { uint x=0u, y=0u, z=0u; lbm.coordinates(n, x, y, z);
-			lbm.rho[n] = 1.0f;
-			lbm.u.x[n] = 0.0f; lbm.u.y[n] = 0.0f; lbm.u.z[n] = 0.0f;
-			if(y==0u || y==Ny-1u) lbm.flags[n] = TYPE_S;
-		});
-		// Mass monitoring for uniform fine
-		const double mass0_uf = (double)lbm.get_N(); // initial mass = N * rho_init(=1)
-		std::ofstream fmass_uf("mass_uniform_fine.csv");
-		fmass_uf << "step,mass,mass_drift_pct" << std::endl;
-		fmass_uf << "0," << mass0_uf << ",0.0" << std::endl;
-		const ulong fine_total = nsteps * 2ull;
-		for(ulong s=0ull; s<fine_total; s+=log_interval*2ull) {
-			const ulong chunk = min(log_interval*2ull, fine_total-s);
-			lbm.run(chunk, fine_total);
-			const double mass = compute_total_mass(&lbm);
-			const double drift = 100.0 * (mass - mass0_uf) / mass0_uf;
-			fmass_uf << (s+chunk) << "," << mass << "," << drift << std::endl;
-			print_info("  Uniform fine step " + to_string(s+chunk) + "/" + to_string(fine_total) + " mass_drift=" + to_string((float)drift) + "%");
+	// Domain: 15D x 8D x 8D (coarse), sphere at 4D from inlet
+	const uint cNx = (uint)(15.0f*D_sphere); // 300
+	const uint cNy = (uint)(8.0f*D_sphere);  // 160
+	const uint cNz = (uint)(8.0f*D_sphere);  // 160
+
+	// Fine zone: around sphere, 2D upstream, 5D downstream, 2D lateral
+	// Sphere center at (4D, Ny/2, Nz/2) = (80, 80, 80)
+	const uint sx = (uint)(4.0f*D_sphere); // sphere center x = 80
+	const uint sy = cNy/2u;                // sphere center y = 80
+	const uint sz = cNz/2u;                // sphere center z = 80
+	// Fine zone: sphere_center ± margins, all even
+	const uint margin_up = (uint)(2.0f*D_sphere);   // 40 upstream
+	const uint margin_down = (uint)(5.0f*D_sphere);  // 100 downstream
+	const uint margin_lat = (uint)(2.0f*D_sphere);   // 40 lateral
+	RefinementZone zone = {
+		(sx-margin_up)/2u*2u,   (sy-margin_lat)/2u*2u, (sz-margin_lat)/2u*2u,  // round down to even
+		(sx+margin_down+1u)/2u*2u, (sy+margin_lat+1u)/2u*2u, (sz+margin_lat+1u)/2u*2u  // round up to even
+	};
+
+	print_info("=== Step 3: Flow past sphere, Re=" + to_string((int)Re) + " ===");
+	print_info("  Sphere D=" + to_string((int)D_sphere) + " at (" + to_string(sx) + "," + to_string(sy) + "," + to_string(sz) + ")");
+	print_info("  Fine zone: [" + to_string(zone.cx0) + "-" + to_string(zone.cx1) + "] x [" +
+	           to_string(zone.cy0) + "-" + to_string(zone.cy1) + "] x [" + to_string(zone.cz0) + "-" + to_string(zone.cz1) + "]");
+
+	MultiBlockLBM mb(cNx, cNy, cNz, nu, zone);
+	LBM* lc = mb.coarse();
+	LBM* lf = mb.fine();
+
+	const float3 sphere_center = float3(sx, sy, sz);
+
+	// Coarse grid setup: inlet (TYPE_E), outlet (TYPE_E), sphere (TYPE_S)
+	const uint Nx=lc->get_Nx(), Ny=lc->get_Ny(), Nz=lc->get_Nz();
+	parallel_for(lc->get_N(), [&](ulong n) { uint x=0u, y=0u, z=0u; lc->coordinates(n, x, y, z);
+		lc->rho[n] = 1.0f;
+		lc->u.x[n] = u_in; lc->u.y[n] = 0.0f; lc->u.z[n] = 0.0f; // uniform inlet flow
+		if(x==0u) { lc->flags[n] = TYPE_E; lc->u.x[n] = u_in; } // inlet
+		if(x==Nx-1u) { lc->flags[n] = TYPE_E; lc->u.x[n] = u_in; } // outlet
+		if(sphere(x, y, z, sphere_center, D_sphere*0.5f)) {
+			lc->flags[n] = TYPE_S; // sphere surface
 		}
-		fmass_uf.close();
-		save_profile(&lbm, lbm.get_Nx()/2u, lbm.get_Nz()/2u, "profile_uniform_fine.csv", 0.0f, 0.5f);
-	}
+	});
 
-	// --- RUN 2: Multi-block with mass monitoring ---
-	{
-		RefinementZone zone = {16u, 16u, 16u, 48u, 48u, 48u}; // fine zone in center, fully 3D
-		print_info("=== RUN 2: Multi-block 3D, coarse=" + to_string(cNx) + "x" + to_string(cNy) + "x" + to_string(cNz) +
-		           " fine=" + to_string((zone.cx1-zone.cx0)*2u) + "x" + to_string((zone.cy1-zone.cy0)*2u) + "x" + to_string((zone.cz1-zone.cz0)*2u) + " ===");
-		MultiBlockLBM mb(cNx, cNy, cNz, nu, zone, fx, 0.0f, 0.0f);
-		LBM* lc = mb.coarse();
-		LBM* lf = mb.fine();
-
-		const uint Ny=lc->get_Ny();
-		parallel_for(lc->get_N(), [&](ulong n) { uint x=0u, y=0u, z=0u; lc->coordinates(n, x, y, z);
-			lc->rho[n] = 1.0f;
-			lc->u.x[n] = 0.0f; lc->u.y[n] = 0.0f; lc->u.z[n] = 0.0f;
-			if(y==0u || y==Ny-1u) lc->flags[n] = TYPE_S;
-		});
-		parallel_for(lf->get_N(), [&](ulong n) { uint x=0u, y=0u, z=0u; lf->coordinates(n, x, y, z);
-			lf->rho[n] = 1.0f;
-			lf->u.x[n] = 0.0f; lf->u.y[n] = 0.0f; lf->u.z[n] = 0.0f;
-		});
-
-		// Mass monitoring: log coarse + fine mass every log_interval steps
-		std::ofstream fmass_mb("mass_multiblock.csv");
-		fmass_mb << "step,mass_coarse,mass_fine,mass_total,mass_drift_pct" << std::endl;
-		// Initial mass = coarse_fluid_cells * 1.0 + fine_cells * 1.0
-		// (TYPE_Y coarse cells are skipped but still have rho=1 in memory — exclude them from mass)
-		mb.initialize();
-		const double mass0_c = compute_total_mass(lc);
-		const double mass0_f = compute_total_mass(lf);
-		const double mass0_total = mass0_c + mass0_f;
-		fmass_mb << "0," << mass0_c << "," << mass0_f << "," << mass0_total << ",0.0" << std::endl;
-
-		for(ulong s=0ull; s<nsteps; s+=log_interval) {
-			const ulong chunk = min(log_interval, nsteps-s);
-			mb.run(chunk);
-			const double mc = compute_total_mass(lc);
-			const double mf = compute_total_mass(lf);
-			const double mt = mc + mf;
-			const double drift = 100.0 * (mt - mass0_total) / mass0_total;
-			fmass_mb << (s+chunk) << "," << mc << "," << mf << "," << mt << "," << drift << std::endl;
-			print_info("  Multi-block step " + to_string(s+chunk) + "/" + to_string(nsteps) + " mass_drift=" + to_string((float)drift) + "%");
+	// Fine grid setup: sphere inside fine zone
+	const uint fNx=lf->get_Nx(), fNy=lf->get_Ny(), fNz=lf->get_Nz();
+	// Sphere center in fine coords: 2*(sx - zone.cx0), 2*(sy - zone.cy0), 2*(sz - zone.cz0)
+	const float3 sphere_center_fine = float3(
+		2.0f*(float)(sx - zone.cx0),
+		2.0f*(float)(sy - zone.cy0),
+		2.0f*(float)(sz - zone.cz0)
+	);
+	const float D_sphere_fine = D_sphere * 2.0f; // fine grid sphere diameter
+	parallel_for(lf->get_N(), [&](ulong n) { uint x=0u, y=0u, z=0u; lf->coordinates(n, x, y, z);
+		lf->rho[n] = 1.0f;
+		lf->u.x[n] = u_in; lf->u.y[n] = 0.0f; lf->u.z[n] = 0.0f;
+		if(sphere(x, y, z, sphere_center_fine, D_sphere_fine*0.5f)) {
+			lf->flags[n] = TYPE_S;
 		}
-		fmass_mb.close();
+	});
 
-		// Extract profiles
-		save_profile(lc, lc->get_Nx()/2u, lc->get_Nz()/2u, "profile_multiblock_coarse.csv", 0.0f, 1.0f);
-		const uint fine_px = 2u * (lc->get_Nx()/2u - zone.cx0);
-		const uint fine_pz = lf->get_Nz() / 2u;
-		save_profile(lf, fine_px, fine_pz, "profile_multiblock_fine.csv", (float)zone.cy0, 0.5f);
+	// Run to quasi-steady state: need ~15D/u convective times
+	// t_conv = 15*D/u = 15*20/0.05 = 6000 coarse steps. Run 20K for safety.
+	const ulong nsteps = 20000ull;
+	const ulong log_interval = 2000ull;
+
+	// Log Cd over time
+	std::ofstream fcd("sphere_cd.csv");
+	fcd << "step,Fx_coarse,Fx_fine,Cd_coarse,Cd_fine" << std::endl;
+
+	mb.initialize();
+
+	for(ulong s=0ull; s<nsteps; s+=log_interval) {
+		mb.run(log_interval);
+
+		// Compute drag on sphere from FINE grid (higher accuracy)
+		lf->update_force_field();
+		const float3 F_fine = lf->object_force(TYPE_S);
+		// Cd = Fx / (0.5 * rho * u^2 * A), A = pi/4 * D^2 (fine grid units)
+		const float A_fine = 3.14159265f / 4.0f * D_sphere_fine * D_sphere_fine;
+		const float Cd_fine = F_fine.x / (0.5f * 1.0f * u_in * u_in * A_fine);
+
+		// Also from coarse grid
+		lc->update_force_field();
+		const float3 F_coarse = lc->object_force(TYPE_S);
+		const float A_coarse = 3.14159265f / 4.0f * D_sphere * D_sphere;
+		const float Cd_coarse = F_coarse.x / (0.5f * 1.0f * u_in * u_in * A_coarse);
+
+		fcd << (s+log_interval) << "," << F_fine.x << "," << F_coarse.x << "," << Cd_fine << "," << Cd_coarse << std::endl;
+		print_info("  Step " + to_string(s+log_interval) + "/" + to_string(nsteps) +
+		           " Cd_fine=" + to_string(Cd_fine) + " Cd_coarse=" + to_string(Cd_coarse));
 	}
+	fcd.close();
 
-	print_info("=== Steps 1+2 complete: Mass conservation + 3D Poiseuille ===");
+	print_info("=== Step 3 complete: Flow past sphere Re=300 ===");
+	print_info("  Reference Cd ~0.656 (Clift, Grace & Weber)");
 }
 #endif // MULTIBLOCK
 
