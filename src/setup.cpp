@@ -40,112 +40,120 @@ void save_profile(LBM* lbm, const uint px, const uint pz, const string& filename
 	print_info("Saved profile to " + filename + " (" + to_string(Ny) + " points)");
 }
 
+// Helper: compute total kinetic energy on an LBM object — reads from device
+double compute_kinetic_energy(LBM* lbm) {
+	lbm->update_fields();
+	for(uint d=0u; d<lbm->get_D(); d++) {
+		lbm->lbm_domain[d]->finish_queue();
+		lbm->lbm_domain[d]->u.read_from_device();
+		lbm->lbm_domain[d]->rho.read_from_device();
+	}
+	double E = 0.0;
+	for(ulong n=0ull; n<lbm->get_N(); n++) {
+		const double ux = (double)lbm->u.x[n];
+		const double uy = (double)lbm->u.y[n];
+		const double uz = (double)lbm->u.z[n];
+		E += 0.5 * (double)lbm->rho[n] * (ux*ux + uy*uy + uz*uz);
+	}
+	return E;
+}
+
+// Helper: set Taylor-Green initial conditions on an LBM object
+// physical_offset: where this grid's (0,0,0) is in global physical coords
+// dx: grid spacing (1.0 for coarse, 0.5 for fine)
+// L: physical domain size (same for all grids)
+void set_tgv_ic(LBM* lbm, const float A, const float L, const float ox, const float oy, const float oz, const float dx) {
+	parallel_for(lbm->get_N(), [&](ulong n) { uint x=0u, y=0u, z=0u; lbm->coordinates(n, x, y, z);
+		// Physical position of this cell's center
+		const float px = ox + ((float)x + 0.5f) * dx;
+		const float py = oy + ((float)y + 0.5f) * dx;
+		const float pz = oz + ((float)z + 0.5f) * dx;
+		// TGV: centered in domain, period = L
+		const float kx = 2.0f * pif * px / L;
+		const float ky = 2.0f * pif * py / L;
+		const float kz = 2.0f * pif * pz / L;
+		lbm->u.x[n] =  A * cosf(kx) * sinf(ky) * sinf(kz);
+		lbm->u.y[n] = -A * sinf(kx) * cosf(ky) * sinf(kz);
+		lbm->u.z[n] =  A * sinf(kx) * sinf(ky) * cosf(kz);
+		lbm->rho[n] = 1.0f - A*A * 3.0f/4.0f * (cosf(2.0f*kx) + cosf(2.0f*ky));
+	});
+}
+
 void main_setup() {
 	// ============================================================
-	// Step 3: Flow past sphere at Re=300
-	// Sphere (D=20 coarse cells) inside fine zone
-	// Inlet velocity u=0.05, nu chosen for Re=u*D/nu=300
-	// Reference Cd ~0.656 (Clift, Grace & Weber)
+	// Step 4: Taylor-Green Vortex decay (3D turbulence test)
+	// Periodic box, TGV initial condition, SUBGRID enabled
+	// Compare kinetic energy decay: uniform fine vs multi-block
 	// ============================================================
-	const float u_in = 0.05f; // inlet velocity (lattice units)
-	const float D_sphere = 20.0f; // sphere diameter in coarse cells
-	const float Re = 300.0f;
-	const float nu = u_in * D_sphere / Re; // = 0.05*20/300 = 0.003333
+	const uint cN = 64u; // coarse grid: 64^3
+	const float A = 0.1f; // TGV amplitude (moderate, keeps Ma low)
+	const float nu = 0.005f; // viscosity → Re = A*L/(2*pi*nu) ~ 200
+	const float L = (float)cN; // physical domain size = coarse grid size
+	const ulong nsteps = 10000ull;
+	const ulong log_interval = 500ull;
 
-	// Domain: 15D x 8D x 8D (coarse), sphere at 4D from inlet
-	const uint cNx = (uint)(15.0f*D_sphere); // 300
-	const uint cNy = (uint)(8.0f*D_sphere);  // 160
-	const uint cNz = (uint)(8.0f*D_sphere);  // 160
+	// --- RUN 1: Uniform fine grid (reference) ---
+	{
+		const uint fN = cN * 2u; // 128^3
+		const float nu_f = 2.0f * nu;
+		print_info("=== Step 4 RUN 1: Uniform fine TGV " + to_string(fN) + "^3 ===");
+		LBM lbm(fN, fN, fN, nu_f);
+		set_tgv_ic(&lbm, A, L, 0.0f, 0.0f, 0.0f, 0.5f); // dx_fine = 0.5
 
-	// Fine zone: around sphere, 2D upstream, 5D downstream, 2D lateral
-	// Sphere center at (4D, Ny/2, Nz/2) = (80, 80, 80)
-	const uint sx = (uint)(4.0f*D_sphere); // sphere center x = 80
-	const uint sy = cNy/2u;                // sphere center y = 80
-	const uint sz = cNz/2u;                // sphere center z = 80
-	// Fine zone: sphere_center ± margins, all even
-	const uint margin_up = (uint)(2.0f*D_sphere);   // 40 upstream
-	const uint margin_down = (uint)(5.0f*D_sphere);  // 100 downstream
-	const uint margin_lat = (uint)(2.0f*D_sphere);   // 40 lateral
-	RefinementZone zone = {
-		(sx-margin_up)/2u*2u,   (sy-margin_lat)/2u*2u, (sz-margin_lat)/2u*2u,  // round down to even
-		(sx+margin_down+1u)/2u*2u, (sy+margin_lat+1u)/2u*2u, (sz+margin_lat+1u)/2u*2u  // round up to even
-	};
+		std::ofstream fe("energy_uniform_fine.csv");
+		fe << "step,energy" << std::endl;
 
-	print_info("=== Step 3: Flow past sphere, Re=" + to_string((int)Re) + " ===");
-	print_info("  Sphere D=" + to_string((int)D_sphere) + " at (" + to_string(sx) + "," + to_string(sy) + "," + to_string(sz) + ")");
-	print_info("  Fine zone: [" + to_string(zone.cx0) + "-" + to_string(zone.cx1) + "] x [" +
-	           to_string(zone.cy0) + "-" + to_string(zone.cy1) + "] x [" + to_string(zone.cz0) + "-" + to_string(zone.cz1) + "]");
+		// Run first chunk to trigger initialize(), then measure E0
+		const ulong fine_total = nsteps * 2ull;
+		lbm.run(1ull, fine_total); // initialize + 1 step
+		const double E0 = compute_kinetic_energy(&lbm);
+		fe << "1," << E0 << std::endl;
 
-	MultiBlockLBM mb(cNx, cNy, cNz, nu, zone);
-	LBM* lc = mb.coarse();
-	LBM* lf = mb.fine();
-
-	const float3 sphere_center = float3(sx, sy, sz);
-
-	// Coarse grid setup: inlet (TYPE_E), outlet (TYPE_E), sphere (TYPE_S)
-	const uint Nx=lc->get_Nx(), Ny=lc->get_Ny(), Nz=lc->get_Nz();
-	parallel_for(lc->get_N(), [&](ulong n) { uint x=0u, y=0u, z=0u; lc->coordinates(n, x, y, z);
-		lc->rho[n] = 1.0f;
-		lc->u.x[n] = u_in; lc->u.y[n] = 0.0f; lc->u.z[n] = 0.0f; // uniform inlet flow
-		if(x==0u) { lc->flags[n] = TYPE_E; lc->u.x[n] = u_in; } // inlet
-		if(x==Nx-1u) { lc->flags[n] = TYPE_E; lc->u.x[n] = u_in; } // outlet
-		if(sphere(x, y, z, sphere_center, D_sphere*0.5f)) {
-			lc->flags[n] = TYPE_S; // sphere surface
+		for(ulong s=1ull; s<fine_total; s+=log_interval*2ull) {
+			const ulong chunk = min(log_interval*2ull, fine_total-s);
+			lbm.run(chunk, fine_total);
+			const double E = compute_kinetic_energy(&lbm);
+			fe << (s+chunk) << "," << E << std::endl;
+			print_info("  Uniform fine step " + to_string(s+chunk) + "/" + to_string(fine_total) + " E/E0=" + to_string((float)(E/E0)));
 		}
-	});
-
-	// Fine grid setup: sphere inside fine zone
-	const uint fNx=lf->get_Nx(), fNy=lf->get_Ny(), fNz=lf->get_Nz();
-	// Sphere center in fine coords: 2*(sx - zone.cx0), 2*(sy - zone.cy0), 2*(sz - zone.cz0)
-	const float3 sphere_center_fine = float3(
-		2.0f*(float)(sx - zone.cx0),
-		2.0f*(float)(sy - zone.cy0),
-		2.0f*(float)(sz - zone.cz0)
-	);
-	const float D_sphere_fine = D_sphere * 2.0f; // fine grid sphere diameter
-	parallel_for(lf->get_N(), [&](ulong n) { uint x=0u, y=0u, z=0u; lf->coordinates(n, x, y, z);
-		lf->rho[n] = 1.0f;
-		lf->u.x[n] = u_in; lf->u.y[n] = 0.0f; lf->u.z[n] = 0.0f;
-		if(sphere(x, y, z, sphere_center_fine, D_sphere_fine*0.5f)) {
-			lf->flags[n] = TYPE_S;
-		}
-	});
-
-	// Run to quasi-steady state: need ~15D/u convective times
-	// t_conv = 15*D/u = 15*20/0.05 = 6000 coarse steps. Run 20K for safety.
-	const ulong nsteps = 20000ull;
-	const ulong log_interval = 2000ull;
-
-	// Log Cd over time
-	std::ofstream fcd("sphere_cd.csv");
-	fcd << "step,Fx_coarse,Fx_fine,Cd_coarse,Cd_fine" << std::endl;
-
-	mb.initialize();
-
-	for(ulong s=0ull; s<nsteps; s+=log_interval) {
-		mb.run(log_interval);
-
-		// Compute drag on sphere from FINE grid (higher accuracy)
-		lf->update_force_field();
-		const float3 F_fine = lf->object_force(TYPE_S);
-		// Cd = Fx / (0.5 * rho * u^2 * A), A = pi/4 * D^2 (fine grid units)
-		const float A_fine = 3.14159265f / 4.0f * D_sphere_fine * D_sphere_fine;
-		const float Cd_fine = F_fine.x / (0.5f * 1.0f * u_in * u_in * A_fine);
-
-		// Also from coarse grid
-		lc->update_force_field();
-		const float3 F_coarse = lc->object_force(TYPE_S);
-		const float A_coarse = 3.14159265f / 4.0f * D_sphere * D_sphere;
-		const float Cd_coarse = F_coarse.x / (0.5f * 1.0f * u_in * u_in * A_coarse);
-
-		fcd << (s+log_interval) << "," << F_fine.x << "," << F_coarse.x << "," << Cd_fine << "," << Cd_coarse << std::endl;
-		print_info("  Step " + to_string(s+log_interval) + "/" + to_string(nsteps) +
-		           " Cd_fine=" + to_string(Cd_fine) + " Cd_coarse=" + to_string(Cd_coarse));
+		fe.close();
 	}
-	fcd.close();
 
-	print_info("=== Step 3 complete: Flow past sphere Re=300 ===");
-	print_info("  Reference Cd ~0.656 (Clift, Grace & Weber)");
+	// --- RUN 2: Multi-block TGV ---
+	{
+		// Fine zone: center of domain [16,48]^3 in coarse coords
+		RefinementZone zone = {16u, 16u, 16u, 48u, 48u, 48u};
+		print_info("=== Step 4 RUN 2: Multi-block TGV, coarse " + to_string(cN) + "^3 + fine 64^3 ===");
+		MultiBlockLBM mb(cN, cN, cN, nu, zone);
+		LBM* lc = mb.coarse();
+		LBM* lf = mb.fine();
+
+		// Set TGV ICs on coarse grid (full domain, physical coords 0..L)
+		set_tgv_ic(lc, A, L, 0.0f, 0.0f, 0.0f, 1.0f); // dx_coarse = 1.0
+
+		// Set TGV ICs on fine grid (sub-domain, physical coords zone.cx0..zone.cx1)
+		set_tgv_ic(lf, A, L, (float)zone.cx0, (float)zone.cy0, (float)zone.cz0, 0.5f);
+
+		std::ofstream fe("energy_multiblock.csv");
+		fe << "step,energy_coarse,energy_fine,energy_total" << std::endl;
+
+		mb.initialize();
+		const double Ec0 = compute_kinetic_energy(lc);
+		const double Ef0 = compute_kinetic_energy(lf);
+		fe << "0," << Ec0 << "," << Ef0 << "," << (Ec0+Ef0) << std::endl;
+
+		for(ulong s=0ull; s<nsteps; s+=log_interval) {
+			mb.run(log_interval);
+			const double Ec = compute_kinetic_energy(lc);
+			const double Ef = compute_kinetic_energy(lf);
+			fe << (s+log_interval) << "," << Ec << "," << Ef << "," << (Ec+Ef) << std::endl;
+			print_info("  Multi-block step " + to_string(s+log_interval) + "/" + to_string(nsteps) +
+			           " E_total/E0=" + to_string((float)((Ec+Ef)/(Ec0+Ef0))));
+		}
+		fe.close();
+	}
+
+	print_info("=== Step 4 complete: Taylor-Green Vortex decay ===");
 }
 #endif // MULTIBLOCK
 
