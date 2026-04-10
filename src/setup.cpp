@@ -33,75 +33,63 @@ void main_setup() {
 	// Channel: walls at y=0 and y=Ny-1, pressure-driven in x
 	// Physical domain: 200 x 60 x 4 (coarse units), quasi-2D in z
 	// ============================================================
-	const uint cNx=40u, cNy=14u, cNz=8u; // coarse grid (tiny channel, t_steady ~ 12^2/0.2 = 720)
-	const float nu = 0.2f; // high viscosity for very fast steady-state
-	const float drho = 0.01f; // pressure difference
-	const ulong nsteps = 50000ull; // long run to ensure steady state
+	// Body-force-driven Poiseuille: u(y) = fx/(2*nu) * y * (H-y), H=Ny-1
+	const uint cNx=64u, cNy=64u, cNz=8u;
+	const float nu = 0.1f;
+	const float fx = 1.0e-5f; // body force in x
+	const ulong nsteps = 50000ull; // t_steady ~ 63^2/0.1 = 39690
 
 	// --- RUN 1: Uniform fine grid (reference) ---
 	// Same physical domain at 2x resolution
 	{
 		const uint fNx=cNx*2u, fNy=cNy*2u, fNz=cNz*2u;
-		const float nu_fine = 2.0f * nu; // lattice nu scales with refinement
+		const float nu_fine = 2.0f * nu;
+		// Force scaling: F_phys = F_lbm * dx/dt^2. With dx_f=dx_c/2, dt_f=dt_c/2: F_f = F_c/2
+		const float fx_fine = fx * 0.5f;
 		print_info("=== RUN 1: Uniform fine grid " + to_string(fNx) + "x" + to_string(fNy) + "x" + to_string(fNz) + " ===");
-		LBM lbm(fNx, fNy, fNz, nu_fine);
-		const uint Nx=lbm.get_Nx(), Ny=lbm.get_Ny(), Nz=lbm.get_Nz();
+		LBM lbm(fNx, fNy, fNz, nu_fine, fx_fine, 0.0f, 0.0f);
+		const uint Ny=lbm.get_Ny();
 		parallel_for(lbm.get_N(), [&](ulong n) { uint x=0u, y=0u, z=0u; lbm.coordinates(n, x, y, z);
 			lbm.rho[n] = 1.0f;
-			lbm.u.x[n] = 0.0f;
-			lbm.u.y[n] = 0.0f;
-			lbm.u.z[n] = 0.0f;
-			if(y==0u || y==Ny-1u) lbm.flags[n] = TYPE_S; // walls
-			if(x==0u)    { lbm.flags[n] = TYPE_E; lbm.rho[n] = 1.0f + drho; }
-			if(x==Nx-1u) { lbm.flags[n] = TYPE_E; lbm.rho[n] = 1.0f; }
+			lbm.u.x[n] = 0.0f; lbm.u.y[n] = 0.0f; lbm.u.z[n] = 0.0f;
+			if(y==0u || y==Ny-1u) lbm.flags[n] = TYPE_S; // walls, periodic in x and z
 		});
-		lbm.run(nsteps);
-		// Extract profile at x=Nx/2 (center of domain), z=Nz/2
-		save_profile(&lbm, Nx/2u, Nz/2u, "profile_uniform_fine.csv", 0.0f, 0.5f); // y_scale=0.5 to convert to coarse units
+		lbm.run(nsteps * 2ull); // fine grid runs 2x steps for same physical time
+		save_profile(&lbm, lbm.get_Nx()/2u, lbm.get_Nz()/2u, "profile_uniform_fine.csv", 0.0f, 0.5f);
 	}
 
 	// --- RUN 2: Multi-block (coarse + fine zone in center) ---
 	{
 		// Fine zone: x=[40,160], y=[10,50], z=[0,4] in coarse coords
 		// This covers most of the channel height, leaving walls in the coarse region
-		RefinementZone zone = {10u, 4u, 2u, 30u, 10u, 6u}; // fine zone covers channel interior y=[4,10]
+		RefinementZone zone = {16u, 16u, 2u, 48u, 48u, 6u}; // fine zone in channel center
 		print_info("=== RUN 2: Multi-block, coarse=" + to_string(cNx) + "x" + to_string(cNy) + "x" + to_string(cNz) +
 		           " fine=" + to_string((zone.cx1-zone.cx0)*2u) + "x" + to_string((zone.cy1-zone.cy0)*2u) + "x" + to_string((zone.cz1-zone.cz0)*2u) + " ===");
-		MultiBlockLBM mb(cNx, cNy, cNz, nu, zone);
+		MultiBlockLBM mb(cNx, cNy, cNz, nu, zone, fx, 0.0f, 0.0f);
 		LBM* lc = mb.coarse();
 		LBM* lf = mb.fine();
 
-		// Coarse grid: walls + pressure BCs
-		const uint Nx=lc->get_Nx(), Ny=lc->get_Ny(), Nz=lc->get_Nz();
+		// Coarse grid: walls at y boundaries, periodic in x,z (default)
+		const uint Ny=lc->get_Ny();
 		parallel_for(lc->get_N(), [&](ulong n) { uint x=0u, y=0u, z=0u; lc->coordinates(n, x, y, z);
 			lc->rho[n] = 1.0f;
-			lc->u.x[n] = 0.0f;
-			lc->u.y[n] = 0.0f;
-			lc->u.z[n] = 0.0f;
+			lc->u.x[n] = 0.0f; lc->u.y[n] = 0.0f; lc->u.z[n] = 0.0f;
 			if(y==0u || y==Ny-1u) lc->flags[n] = TYPE_S; // walls
-			if(x==0u)    { lc->flags[n] = TYPE_E; lc->rho[n] = 1.0f + drho; }
-			if(x==Nx-1u) { lc->flags[n] = TYPE_E; lc->rho[n] = 1.0f; }
 		});
 
-		// Fine grid: default init (coupling sets ghost cells)
+		// Fine grid: default init (no walls needed — walls are in coarse region)
 		parallel_for(lf->get_N(), [&](ulong n) { uint x=0u, y=0u, z=0u; lf->coordinates(n, x, y, z);
 			lf->rho[n] = 1.0f;
-			lf->u.x[n] = 0.0f;
-			lf->u.y[n] = 0.0f;
-			lf->u.z[n] = 0.0f;
+			lf->u.x[n] = 0.0f; lf->u.y[n] = 0.0f; lf->u.z[n] = 0.0f;
 		});
 
 		mb.run(nsteps);
 
-		// Extract coarse profile at x=100 (center), z=Nz/2
-		save_profile(lc, Nx/2u, Nz/2u, "profile_multiblock_coarse.csv", 0.0f, 1.0f);
-
-		// Extract fine profile at the same physical location
-		// Fine x = 2*(100 - zone.cx0) = 2*(100-40) = 120, fine z = 2*(Nz/2 - zone.cz0) = 2*(2-0) = 4
-		const uint fine_px = 2u * (Nx/2u - zone.cx0);
-		const uint fine_fNz = lf->get_Nz();
-		const uint fine_pz = fine_fNz / 2u;
-		save_profile(lf, fine_px, fine_pz, "profile_multiblock_fine.csv", (float)zone.cy0, 0.5f); // offset by zone.cy0 coarse units
+		// Extract profiles
+		save_profile(lc, lc->get_Nx()/2u, lc->get_Nz()/2u, "profile_multiblock_coarse.csv", 0.0f, 1.0f);
+		const uint fine_px = 2u * (lc->get_Nx()/2u - zone.cx0);
+		const uint fine_pz = lf->get_Nz() / 2u;
+		save_profile(lf, fine_px, fine_pz, "profile_multiblock_fine.csv", (float)zone.cy0, 0.5f);
 	}
 
 	print_info("=== Validation complete. Compare CSV files. ===");
