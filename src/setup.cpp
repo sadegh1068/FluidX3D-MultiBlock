@@ -108,10 +108,11 @@ void main_setup() {
 	// Fine zone: y=[8,24] — far enough from wall (7 coarse cells between wall and interface)
 	// Interface at y=8 and y=24 are both in smooth-flow regions
 	RefinementZone zone = {2u, 8u, 2u, 62u, 24u, 62u};
-
 	MultiBlockLBM mb(cNx, cNy, cNz, nu, zone, fx, 0.0f, 0.0f);
 	LBM* lc = mb.coarse();
 	LBM* lf = mb.fine();
+	lc->graphics.visualization_modes = VIS_FLAG_LATTICE|VIS_FIELD; // show wireframe + velocity field on coarse grid only
+	lf->graphics.visualization_modes = 0u; // disable fine grid rendering (coordinate system doesn't match)
 
 	// Coarse grid: walls at y=0 and y=Ny-1, parabolic IC + perturbation
 	const uint Nx=lc->get_Nx(), Ny=lc->get_Ny(), Nz=lc->get_Nz();
@@ -146,82 +147,7 @@ void main_setup() {
 		// But we DO need the fine grid's bottom face to have correct near-wall velocity (≈0).
 	});
 
-	// Run warmup + statistics collection
-	mb.initialize();
-
-	// DIAGNOSTIC: check fine grid works after 10 steps
-	mb.run(10ull);
-	lf->update_fields();
-	lf->lbm_domain[0]->finish_queue();
-	lf->lbm_domain[0]->u.read_from_device();
-	// Sample interior fine cell (middle of fine grid)
-	const ulong diag_n = (ulong)(fNx/2u) + ((ulong)(fNy/2u) + (ulong)(fNz/2u)*(ulong)fNy)*(ulong)fNx;
-	print_info("  DIAG: fine grid center u.x = " + to_string(lf->u.x[diag_n]) + " (should be >0)");
-	print_info("  DIAG: fine grid fNx=" + to_string(fNx) + " fNy=" + to_string(fNy) + " fNz=" + to_string(fNz));
-	// Check a few fine cells
-	for(uint y=0u; y<fNy; y+=fNy/4u) {
-		const ulong idx = (ulong)(fNx/2u) + ((ulong)y + (ulong)(fNz/2u)*(ulong)fNy)*(ulong)fNx;
-		print_info("  DIAG: fine y=" + to_string(y) + " u.x=" + to_string(lf->u.x[idx]) + " flags=" + to_string((int)lf->flags[idx]));
-	}
-
-	print_info("  Warmup: " + to_string(warmup) + " steps...");
-	mb.run(warmup);
-	print_info("  Warmup done. Collecting statistics for " + to_string(nsteps-warmup) + " steps...");
-
-	// Collect time-averaged u(y) profile from fine grid (near wall) and coarse grid (bulk)
-	const uint n_avg = (uint)((nsteps - warmup) / log_interval);
-	std::vector<double> avg_ux_coarse(Ny, 0.0), avg_ux_fine(fNy, 0.0);
-	uint avg_count = 0u;
-
-	for(ulong s=warmup; s<nsteps; s+=log_interval) {
-		mb.run(log_interval);
-		avg_count++;
-
-		// Read u from device via domain buffer (not Memory_Container which may be stale)
-		lc->update_fields();
-		lc->lbm_domain[0]->finish_queue();
-		lc->lbm_domain[0]->u.read_from_device();
-		for(uint y=0u; y<Ny; y++) {
-			const ulong idx = (ulong)(Nx/2u) + ((ulong)y + (ulong)(Nz/2u)*(ulong)Ny)*(ulong)Nx;
-			avg_ux_coarse[y] += (double)lc->lbm_domain[0]->u[idx]; // read from domain buffer directly
-		}
-
-		lf->update_fields();
-		lf->lbm_domain[0]->finish_queue();
-		lf->lbm_domain[0]->u.read_from_device();
-		const uint fpx = fNx/2u, fpz = fNz/2u;
-		for(uint y=0u; y<fNy; y++) {
-			const ulong idx = (ulong)fpx + ((ulong)y + (ulong)fpz*(ulong)fNy)*(ulong)fNx;
-			avg_ux_fine[y] += (double)lf->lbm_domain[0]->u[idx]; // read from domain buffer directly
-		}
-
-		print_info("  Step " + to_string(s+log_interval) + "/" + to_string(nsteps) + " (avg #" + to_string(avg_count) + ")");
-	}
-
-	// Write averaged profiles
-	std::ofstream fc("channel_profile_coarse.csv");
-	fc << "y,y_plus,ux_mean,u_plus" << std::endl;
-	for(uint y=0u; y<Ny; y++) {
-		const double ux = avg_ux_coarse[y] / (double)avg_count;
-		const double yp = (double)y * u_tau_target / nu; // y+ = y * u_tau / nu
-		const double up = ux / (double)u_tau_target;     // u+ = u / u_tau
-		fc << y << "," << yp << "," << ux << "," << up << std::endl;
-	}
-	fc.close();
-
-	std::ofstream ff("channel_profile_fine.csv");
-	ff << "y_fine,y_physical,y_plus,ux_mean,u_plus" << std::endl;
-	for(uint y=0u; y<fNy; y++) {
-		const double ux = avg_ux_fine[y] / (double)avg_count;
-		const double py = (double)zone.cy0 + ((double)y + 0.5) * 0.5; // physical y in coarse units
-		const double yp = py * u_tau_target / nu;
-		const double up = ux / (double)u_tau_target;
-		ff << y << "," << py << "," << yp << "," << ux << "," << up << std::endl;
-	}
-	ff.close();
-
-	print_info("=== Step 5 complete: Turbulent channel flow ===");
-	print_info("  Profiles saved to channel_profile_coarse.csv and channel_profile_fine.csv");
+	mb.run(max_ulong); // run forever (interactive graphics) or until killed
 }
 #endif // MULTIBLOCK
 

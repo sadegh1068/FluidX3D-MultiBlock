@@ -51,12 +51,18 @@ private:
 	// For each coarse interface cell: 8 fine child indices
 	Memory<uint>* dev_avg_fine_children = nullptr; // [N_iface * 8] fine child indices
 
+	// Visualization: map TYPE_Y interior coarse cells → fine children
+	Memory<uint>* dev_vis_coarse_indices = nullptr; // [N_interior] coarse TYPE_Y cell indices
+	Memory<uint>* dev_vis_fine_children = nullptr; // [N_interior * 8] fine child indices
+
 	uint n_fine_ghost = 0u;
 	uint n_coarse_iface = 0u;
+	uint n_coarse_interior = 0u; // TYPE_Y cells for visualization sync
 
 	// GPU coupling kernels (compiled in shared context)
 	Kernel* kernel_c2f = nullptr; // coarse→fine interpolation
 	Kernel* kernel_f2c = nullptr; // fine→coarse averaging
+	Kernel* kernel_vis_sync = nullptr; // copy fine data into coarse TYPE_Y cells for rendering
 
 	void build_coupling_gpu();
 	void flag_coarse_zone();
@@ -64,4 +70,5 @@ private:
 
 	void gpu_push_c2f(); // run C→F kernel on GPU (no PCIe transfer)
 	void gpu_push_f2c(); // run F→C kernel on GPU (no PCIe transfer)
+	void gpu_vis_sync(); // sync fine→coarse interior for visualization
 };

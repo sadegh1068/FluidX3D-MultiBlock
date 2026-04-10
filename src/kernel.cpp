@@ -3060,6 +3060,29 @@ string opencl_c_container() { return R( // ########################## begin of O
 	u_c[cN+(ulong)nc]      = uy_avg  * 0.125f;
 	u_c[2ul*cN+(ulong)nc]  = uz_avg  * 0.125f;
 }
+)+R(kernel void coupling_vis_sync( // copy fine grid averaged rho/u into coarse TYPE_Y cells for visualization
+	const global float* rho_f, const global float* u_f,
+	global float* rho_c, global float* u_c,
+	const global uint* coarse_idx,        // coarse TYPE_Y cell indices [N_interior]
+	const global uint* fine_children,     // 8 fine child indices per coarse cell [N_interior*8]
+	const ulong cN, const ulong fN, const uint N_interior
+) {
+	const uint i = get_global_id(0);
+	if(i >= N_interior) return;
+	const uint nc = coarse_idx[i];
+	float rho_avg=0.0f, ux_avg=0.0f, uy_avg=0.0f, uz_avg=0.0f;
+	for(uint s=0u; s<8u; s++) {
+		const uint nf = fine_children[i*8u+s];
+		rho_avg += rho_f[nf];
+		ux_avg  += u_f[nf];
+		uy_avg  += u_f[fN+(ulong)nf];
+		uz_avg  += u_f[2ul*fN+(ulong)nf];
+	}
+	rho_c[nc]              = rho_avg * 0.125f;
+	u_c[nc]                = ux_avg  * 0.125f;
+	u_c[cN+(ulong)nc]      = uy_avg  * 0.125f;
+	u_c[2ul*cN+(ulong)nc]  = uz_avg  * 0.125f;
+}
 )+R(
 
 );} // ############################################################### end of OpenCL C code #####################################################################

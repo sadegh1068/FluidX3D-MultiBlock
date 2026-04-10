@@ -1,5 +1,5 @@
 #include "multiblock.hpp"
-#include "setup.hpp"
+#include "info.hpp"
 
 MultiBlockLBM::MultiBlockLBM(
 	const uint cNx, const uint cNy, const uint cNz,
@@ -42,11 +42,14 @@ MultiBlockLBM::MultiBlockLBM(
 MultiBlockLBM::~MultiBlockLBM() {
 	delete kernel_c2f;
 	delete kernel_f2c;
+	delete kernel_vis_sync;
 	delete dev_fine_ghost_indices;
 	delete dev_coarse_iface_indices;
 	delete dev_interp_coarse_indices;
 	delete dev_interp_weights;
 	delete dev_avg_fine_children;
+	delete dev_vis_coarse_indices;
+	delete dev_vis_fine_children;
 	delete lbm_c;
 	delete lbm_f;
 }
@@ -217,7 +220,45 @@ void MultiBlockLBM::build_coupling_gpu() {
 		cN, fN, n_coarse_iface
 	);
 
-	print_info("MultiBlockLBM: GPU coupling kernels compiled");
+	// Visualization sync: build index list for TYPE_Y interior cells → fine children
+	vector<uint> h_vis_coarse;
+	vector<uint> h_vis_children;
+	for(uint z=zone.cz0; z<zone.cz1; z++) {
+		for(uint y=zone.cy0; y<zone.cy1; y++) {
+			for(uint x=zone.cx0; x<zone.cx1; x++) {
+				const bool on_border = (x==zone.cx0 || x==zone.cx1-1u ||
+				                        y==zone.cy0 || y==zone.cy1-1u ||
+				                        z==zone.cz0 || z==zone.cz1-1u);
+				if(on_border) continue; // interface cells handled by coupling_f2c
+				h_vis_coarse.push_back(x + (y + z*cNy)*cNx);
+				const uint fx0 = 2u * (x - zone.cx0);
+				const uint fy0 = 2u * (y - zone.cy0);
+				const uint fz0 = 2u * (z - zone.cz0);
+				for(uint dk=0u; dk<2u; dk++)
+					for(uint dj=0u; dj<2u; dj++)
+						for(uint di=0u; di<2u; di++)
+							h_vis_children.push_back((fx0+di) + ((fy0+dj) + (fz0+dk)*fNy)*fNx);
+			}
+		}
+	}
+	n_coarse_interior = (uint)h_vis_coarse.size();
+
+	dev_vis_coarse_indices = new Memory<uint>(dev, n_coarse_interior);
+	dev_vis_fine_children = new Memory<uint>(dev, n_coarse_interior * 8u);
+	for(uint i=0u; i<n_coarse_interior; i++) (*dev_vis_coarse_indices)[i] = h_vis_coarse[i];
+	for(uint i=0u; i<n_coarse_interior*8u; i++) (*dev_vis_fine_children)[i] = h_vis_children[i];
+	dev_vis_coarse_indices->enqueue_write_to_device();
+	dev_vis_fine_children->enqueue_write_to_device();
+	dev.finish_queue();
+
+	kernel_vis_sync = new Kernel(dev, n_coarse_interior, "coupling_vis_sync",
+		lbm_f->lbm_domain[0]->rho, lbm_f->lbm_domain[0]->u,
+		lbm_c->lbm_domain[0]->rho, lbm_c->lbm_domain[0]->u,
+		*dev_vis_coarse_indices, *dev_vis_fine_children,
+		cN, fN, n_coarse_interior
+	);
+
+	print_info("MultiBlockLBM: GPU coupling kernels compiled (+ vis sync for " + to_string(n_coarse_interior) + " interior cells)");
 }
 
 void MultiBlockLBM::gpu_push_c2f() {
@@ -228,12 +269,19 @@ void MultiBlockLBM::gpu_push_f2c() {
 	kernel_f2c->enqueue_run();
 }
 
+void MultiBlockLBM::gpu_vis_sync() {
+	kernel_vis_sync->enqueue_run();
+}
+
 void MultiBlockLBM::initialize() {
 	flag_coarse_zone();
 	flag_fine_boundaries();
 
 	// Initialize both LBM objects (copies host data to GPU, compiles kernels)
 	lbm_c->initialize();
+#ifdef GRAPHICS
+	lbm_f->graphics.visualization_modes = 0u; // prevent fine grid from rendering
+#endif
 	lbm_f->initialize();
 
 	// Build GPU coupling after LBM initialization (buffers must exist on device)
@@ -250,9 +298,20 @@ void MultiBlockLBM::initialize() {
 }
 
 void MultiBlockLBM::run(const ulong coarse_steps) {
-	if(!lbm_c->initialized) initialize();
+	if(!lbm_c->initialized) {
+		initialize();
+		info.print_initialize(lbm_c); // print setup info and enable graphics rendering
+#ifdef GRAPHICS
+		camera.allow_rendering = true;
+#endif // GRAPHICS
+	}
 
 	for(ulong step=0ull; step<coarse_steps; step++) {
+#if defined(INTERACTIVE_GRAPHICS)||defined(INTERACTIVE_GRAPHICS_ASCII)
+		while(!key_P&&running) sleep(0.016);
+		if(!running) break;
+#endif // INTERACTIVE_GRAPHICS || INTERACTIVE_GRAPHICS_ASCII
+
 		// === Step 1: C→F coupling (GPU kernel, no PCIe) ===
 		gpu_push_c2f();
 
@@ -276,6 +335,9 @@ void MultiBlockLBM::run(const ulong coarse_steps) {
 
 		// === Step 7: F→C coupling (final restriction) ===
 		gpu_push_f2c();
+
+		// === Visualization: copy fine rho/u into coarse TYPE_Y cells ===
+		gpu_vis_sync();
 	}
 
 	lbm_c->lbm_domain[0]->finish_queue();
